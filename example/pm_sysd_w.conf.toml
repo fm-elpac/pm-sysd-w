@@ -1,0 +1,29 @@
+# pm_sysd_w.conf.toml
+#
+# pm-sysd-w 集中式配置文件 (由 pm-tc 读取).
+#
+pm_tc = 1
+
+# 一个 unit (service): test-run.service
+[[t.sysd]]
+"env:Unit" = "test-run.service"
+"env:Unit.Description" = "Run a test program"
+
+"env:Service.ExecStart" = "path/to/bin --arg"
+
+"env:Service.Restart" = "always"
+"env:Service.RestartSec" = "10"
+
+"env:Install.WantedBy" = "default.target"
+
+# (可选) Windows 专属: 启动时设置 CREATE_NO_WINDOW, 避免 console 程序显示黑窗口.
+# "env:Win.CreateNoWindow" = "yes"
+
+# 另一个 unit (service): hello.service
+[[t.sysd]]
+"env:Unit" = "hello.service"
+"env:Unit.Description" = "Say hello"
+
+"env:Service.ExecStart" = "path/to/hello.exe"
+
+"env:Install.WantedBy" = "default.target"

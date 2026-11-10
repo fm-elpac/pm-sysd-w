@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Linux (x86_64-unknown-linux-gnu): 主要测试平台
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - run: deno fmt --check
+      - run: cargo fmt --check
+
+      - run: cargo build
+      - run: cargo test --all-features
+      - run: cargo doc
+
+      # release: 分别启用 feature 编译 bin (得到不同的 --version 输出)
+      - run: cargo build --release --features cli_init
+      - run: cargo build --release --features cli_ctl
+      - run: cargo build --release --features cli_log
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pm-sysd-w-x86_64-unknown-linux-gnu
+          path: |
+            target/release/pm-sysd-init
+            target/release/pm-sysd-ctl
+            target/release/pm-sysd-log
+
+  # Windows (x86_64-pc-windows-msvc): 主要支持平台
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: cargo build
+      - run: cargo test --all-features
+
+      # release: 分别启用 feature 编译 bin
+      - run: cargo build --release --features cli_init
+      - run: cargo build --release --features cli_ctl
+      - run: cargo build --release --features cli_log
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pm-sysd-w-x86_64-pc-windows-msvc
+          path: |
+            target/release/pm-sysd-init.exe
+            target/release/pm-sysd-ctl.exe
+            target/release/pm-sysd-log.exe
