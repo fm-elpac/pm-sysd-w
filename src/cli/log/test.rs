@@ -1,6 +1,6 @@
 //! cli::log 模块测试.
 
-use super::*;
+use super::{Instance, format_ts, parse_args};
 
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -8,15 +8,16 @@ fn s(v: &[&str]) -> Vec<String> {
 
 #[test]
 fn parse_args_default() {
+    // 未显式指定实例时, parse_args 返回 None; 实际选择在 resolve_instance 中完成.
     let a = parse_args(&s(&[])).unwrap();
-    assert_eq!(a.instance, Instance::System);
+    assert_eq!(a.instance, None);
     assert!(a.unit.is_none());
 }
 
 #[test]
 fn parse_args_unit() {
     let a = parse_args(&s(&["-eu", "a.service"])).unwrap();
-    assert_eq!(a.instance, Instance::System);
+    assert_eq!(a.instance, None);
     assert_eq!(a.unit.as_deref(), Some("a.service"));
 }
 
@@ -42,6 +43,18 @@ fn parse_args_unit_eq() {
 }
 
 #[test]
+fn parse_args_unit_completes_service_suffix() {
+    let a = parse_args(&s(&["-u", "a"])).unwrap();
+    assert_eq!(a.unit.as_deref(), Some("a.service"));
+
+    let a = parse_args(&s(&["--unit=a"])).unwrap();
+    assert_eq!(a.unit.as_deref(), Some("a.service"));
+
+    let a = parse_args(&s(&["-eua"])).unwrap();
+    assert_eq!(a.unit.as_deref(), Some("a.service"));
+}
+
+#[test]
 fn parse_args_flags_ignored() {
     let a = parse_args(&s(&["-e", "-x", "--pager-end", "--catalog"])).unwrap();
     assert!(a.unit.is_none());
@@ -50,20 +63,20 @@ fn parse_args_flags_ignored() {
 #[test]
 fn parse_args_machine() {
     let a = parse_args(&s(&["--machine=dev", "-u", "a.service"])).unwrap();
-    assert_eq!(a.instance, Instance::Machine("dev".to_string()));
+    assert_eq!(a.instance, Some(Instance::Machine("dev".to_string())));
     assert_eq!(a.unit.as_deref(), Some("a.service"));
 }
 
 #[test]
 fn parse_args_machine_eq() {
     let a = parse_args(&s(&["-M=dev"])).unwrap();
-    assert_eq!(a.instance, Instance::Machine("dev".to_string()));
+    assert_eq!(a.instance, Some(Instance::Machine("dev".to_string())));
 }
 
 #[test]
 fn parse_args_machine_separate() {
     let a = parse_args(&s(&["-M", "dev"])).unwrap();
-    assert_eq!(a.instance, Instance::Machine("dev".to_string()));
+    assert_eq!(a.instance, Some(Instance::Machine("dev".to_string())));
 }
 
 #[test]
@@ -79,6 +92,12 @@ fn parse_args_unit_missing() {
 #[test]
 fn parse_args_unknown() {
     assert!(parse_args(&s(&["--bogus"])).is_err());
+}
+
+#[test]
+fn parse_args_instance_conflict() {
+    assert!(parse_args(&s(&["--system", "--user"])).is_err());
+    assert!(parse_args(&s(&["--system", "-M", "dev"])).is_err());
 }
 
 #[test]

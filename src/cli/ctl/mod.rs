@@ -4,26 +4,30 @@
 //!
 //! 显示/格式化输出 由本模块负责; init 只返回 结构化 数据.
 
+use std::process::ExitCode;
+
+use tokio::runtime::Runtime;
+
+use crate::{
+    cli::{complete_unit, connect, resolve_instance, set_instance},
+    jsonl::{SdReq, SdRes, decode_frame, encode_frame},
+    pa::Instance,
+};
+
 mod error;
+mod print;
+
 #[cfg(test)]
 mod test;
 
 pub use error::CtlError;
 
-use std::process::ExitCode;
-
-use crate::{
-    jsonl::{
-        self, ActiveState, Command, EnableState, Response, SubState, TimerInfo, UnitConfig,
-        UnitInfo, UnitStatus,
-    },
-    pa::{Instance, Pa},
-};
+use print::print_response;
 
 /// pm-sysd-ctl 命令行参数 (原始, 未做命令语义检查).
 struct Args {
-    /// 实例.
-    instance: Instance,
+    /// 实例 (未显式指定时为 `None`, 连接时 再解析默认实例).
+    instance: Option<Instance>,
     /// 命令 (字符串).
     command: String,
     /// unit 位置参数.
@@ -49,22 +53,20 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    // `whoami`: 报告 实例名称 (无需连接).
-    if args.command == "whoami" {
-        println!("{}", args.instance.name());
-        return Ok(());
-    }
-
-    // 在发送命令之前, 先做 命令语法检查.
-    let command = match build_command(&args.command, &args.units, args.now) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}", e);
-            return Err(ExitCode::FAILURE);
+    // 在发送命令之前, 先做 命令语法检查 (`whoami` 不需要命令参数).
+    let command = if args.command == "whoami" {
+        None
+    } else {
+        match build_command(&args.command, &args.units, args.now) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("{}", e);
+                return Err(ExitCode::FAILURE);
+            }
         }
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
+    let rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("{}", e);
@@ -72,9 +74,33 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    match rt.block_on(run(command, args.instance)) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ExitCode::FAILURE),
+    // 解析 实际连接的实例: 未显式指定时, 优先 --system, 不存在则回退 --user.
+    let instance = match resolve_instance(args.instance) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{}", e);
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
+    // `whoami`: 报告 实际选择的实例名称.
+    if args.command == "whoami" {
+        println!("{}", instance.name());
+        return Ok(());
+    }
+
+    match rt.block_on(run(
+        command.expect("non-whoami command"),
+        &args.command,
+        instance,
+    )) {
+        Ok(code) => {
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(ExitCode::from(code))
+            }
+        }
         Err(e) => {
             eprintln!("{}", e);
             Err(ExitCode::FAILURE)
@@ -93,22 +119,25 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
     while i < a.len() {
         let arg = &a[i];
         match arg.as_str() {
-            "--system" => instance = Some(Instance::System),
-            "--user" => instance = Some(Instance::User),
+            "--system" => set_instance(&mut instance, Instance::System).map_err(CtlError::Msg)?,
+            "--user" => set_instance(&mut instance, Instance::User).map_err(CtlError::Msg)?,
             "--now" => now = true,
             "--wait" | "--no-block" => {}
             "-h" | "--help" => {}
             _ => {
                 if let Some(v) = arg.strip_prefix("--machine=") {
-                    instance = Some(Instance::Machine(v.to_string()));
+                    set_instance(&mut instance, Instance::Machine(v.to_string()))
+                        .map_err(CtlError::Msg)?;
                 } else if let Some(v) = arg.strip_prefix("-M=") {
-                    instance = Some(Instance::Machine(v.to_string()));
+                    set_instance(&mut instance, Instance::Machine(v.to_string()))
+                        .map_err(CtlError::Msg)?;
                 } else if arg == "-M" {
                     i += 1;
                     let v = a
                         .get(i)
                         .ok_or_else(|| CtlError::Msg("-M needs NAME".into()))?;
-                    instance = Some(Instance::Machine(v.clone()));
+                    set_instance(&mut instance, Instance::Machine(v.clone()))
+                        .map_err(CtlError::Msg)?;
                 } else if arg.starts_with('-') {
                     return Err(CtlError::Msg(format!("unknown option: {}", arg)));
                 } else if command.is_none() {
@@ -122,7 +151,6 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
     }
 
     let command = command.ok_or_else(|| CtlError::Msg("missing command".into()))?;
-    let instance = instance.unwrap_or(Instance::System);
 
     Ok(Args {
         instance,
@@ -132,9 +160,12 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
     })
 }
 
-/// 把 命令字符串 + 参数 转换为 结构化 [`Command`], 并做 语法检查.
-fn build_command(command: &str, units: &[String], now: bool) -> Result<Command, CtlError> {
-    use Command as C;
+/// 把 命令字符串 + 参数 转换为 结构化 [`SdReq`], 并做 语法检查.
+fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, CtlError> {
+    use crate::jsonl::{
+        SdReq as C, SdReqSysd as Sy, SdReqUnit as U, SdReqUnitOp as Op, SdReqUnitOpRO as Rop,
+        SdReqUnitRO as Ur, SdReqUnitd as Ud, SdReqUnitdRO as Udr,
+    };
 
     if now && !matches!(command, "enable" | "disable") {
         return Err(CtlError::Msg(
@@ -142,16 +173,31 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<Command, 
         ));
     }
 
-    // 读取 恰好 1 个 unit 参数.
+    // 读取 恰好 1 个 unit 参数 (名称未写后缀时 自动补 `.service`).
     let unit = |name: &str| -> Result<String, CtlError> {
         match units.len() {
-            1 => Ok(units[0].clone()),
+            1 => Ok(complete_unit(&units[0])),
             0 => Err(CtlError::Msg(format!(
                 "command `{}` needs a unit name",
                 name
             ))),
             _ => Err(CtlError::Msg(format!(
                 "command `{}` takes only 1 unit name",
+                name
+            ))),
+        }
+    };
+
+    // 读取 恰好 1 个 target 参数 (set-default 原样透传, 不做补全).
+    let target = |name: &str| -> Result<String, CtlError> {
+        match units.len() {
+            1 => Ok(units[0].clone()),
+            0 => Err(CtlError::Msg(format!(
+                "command `{}` needs a target name",
+                name
+            ))),
+            _ => Err(CtlError::Msg(format!(
+                "command `{}` takes only 1 target name",
                 name
             ))),
         }
@@ -172,360 +218,163 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<Command, 
     Ok(match command {
         "list-units" => {
             no_args(command)?;
-            C::ListUnits
+            C::UnitdRO(Udr::ListUnits)
         }
         "list-timers" => {
             no_args(command)?;
-            C::ListTimers
+            C::UnitdRO(Udr::ListTimers)
         }
-        "is-active" => C::IsActive {
-            unit: unit(command)?,
-        },
-        "is-failed" => C::IsFailed {
-            unit: unit(command)?,
-        },
-        "status" => C::Status {
-            unit: unit(command)?,
-        },
-        "show" => C::Show {
-            unit: unit(command)?,
-        },
-        "cat" => C::Cat {
-            unit: unit(command)?,
-        },
-        "list-dependencies" => C::ListDependencies {
-            unit: unit(command)?,
-        },
-        "start" => C::Start {
-            unit: unit(command)?,
-        },
-        "stop" => C::Stop {
-            unit: unit(command)?,
-        },
-        "reload" => C::Reload {
-            unit: unit(command)?,
-        },
-        "restart" => C::Restart {
-            unit: unit(command)?,
-        },
-        "try-restart" => C::TryRestart {
-            unit: unit(command)?,
-        },
-        "reload-or-restart" => C::ReloadOrRestart {
-            unit: unit(command)?,
-        },
-        "try-reload-or-restart" => C::TryReloadOrRestart {
-            unit: unit(command)?,
-        },
-        "kill" => C::Kill {
-            unit: unit(command)?,
-        },
-        "clean" => C::Clean {
-            unit: unit(command)?,
-        },
-        "reset-failed" => C::ResetFailed {
-            unit: match units.len() {
-                0 => None,
-                1 => Some(units[0].clone()),
+        "is-active" | "is-failed" | "is-enabled" => C::UnitRO(Ur {
+            name: unit(command)?,
+            op: Rop::UnitState,
+        }),
+        "status" => C::UnitRO(Ur {
+            name: unit(command)?,
+            op: Rop::Status,
+        }),
+        "show" | "cat" => C::UnitRO(Ur {
+            name: unit(command)?,
+            op: Rop::Config,
+        }),
+        "list-dependencies" => C::UnitRO(Ur {
+            name: unit(command)?,
+            op: Rop::ListDependencies,
+        }),
+        "start" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Start,
+        }),
+        "stop" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Stop,
+        }),
+        "reload" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Reload,
+        }),
+        "restart" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Restart,
+        }),
+        "try-restart" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::TryRestart,
+        }),
+        "reload-or-restart" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::ReloadOrRestart,
+        }),
+        "try-reload-or-restart" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::TryReloadOrRestart,
+        }),
+        "kill" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Kill,
+        }),
+        "clean" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Clean,
+        }),
+        "reset-failed" => C::Unit(U {
+            name: match units.len() {
+                0 => String::new(),
+                1 => complete_unit(&units[0]),
                 _ => {
                     return Err(CtlError::Msg(
                         "command `reset-failed` takes at most 1 unit name".into(),
                     ));
                 }
             },
-        },
-        "enable" => C::Enable {
-            unit: unit(command)?,
-            now,
-        },
-        "disable" => C::Disable {
-            unit: unit(command)?,
-            now,
-        },
-        "reenable" => C::Reenable {
-            unit: unit(command)?,
-        },
-        "preset" => C::Preset {
-            unit: unit(command)?,
-        },
-        "is-enabled" => C::IsEnabled {
-            unit: unit(command)?,
-        },
-        "mask" => C::Mask {
-            unit: unit(command)?,
-        },
-        "unmask" => C::Unmask {
-            unit: unit(command)?,
-        },
+            op: Op::ResetFailed,
+        }),
+        "enable" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Enable { now },
+        }),
+        "disable" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Disable { now },
+        }),
+        "reenable" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Reenable,
+        }),
+        "preset" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Preset,
+        }),
+        "mask" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Mask,
+        }),
+        "unmask" => C::Unit(U {
+            name: unit(command)?,
+            op: Op::Unmask,
+        }),
         "get-default" => {
             no_args(command)?;
-            C::GetDefault
+            C::UnitdRO(Udr::GetDefault)
         }
-        "set-default" => C::SetDefault {
-            target: unit(command)?,
-        },
+        "set-default" => C::UnitD(Ud::SetDefault {
+            target: target(command)?,
+        }),
         "show-environment" => {
             no_args(command)?;
-            C::ShowEnvironment
+            C::UnitdRO(Udr::ShowEnvironment)
         }
         "set-environment" => {
             no_args(command)?;
-            C::SetEnvironment
+            C::UnitD(Ud::SetEnvironment)
         }
         "unset-environment" => {
             no_args(command)?;
-            C::UnsetEnvironment
+            C::UnitD(Ud::UnsetEnvironment)
         }
+        // import-environment 是 ctl 本地功能, 不直接对应一条 init 请求.
+        // 实现时: 读取 ctl 自身进程 对应名称的 环境变量, 用其值调用 set-environment.
+        // 目前 不实现.
         "import-environment" => {
             no_args(command)?;
-            C::ImportEnvironment
+            return Err(CtlError::Msg("import-environment not implemented".into()));
         }
         "daemon-reload" => {
             no_args(command)?;
-            C::DaemonReload
+            C::UnitD(Ud::DaemonReload)
         }
         "soft-reboot" => {
             no_args(command)?;
-            C::SoftReboot
+            C::SysD(Sy::SoftReboot)
         }
         "exit" => {
             no_args(command)?;
-            C::Exit
+            C::SysD(Sy::Exit)
         }
         other => return Err(CtlError::Msg(format!("unknown command: {}", other))),
     })
 }
 
 /// 主流程.
-async fn run(command: Command, instance: Instance) -> Result<bool, CtlError> {
-    // 平台 实现 (编译时确定 具体类型).
-    let pa = crate::Platform::default();
-    let transport = instance.transport();
-    let mut stream = pa
-        .ipc_connect(&transport)
-        .await
-        .map_err(|e| CtlError::Msg(format!("connect `{}`: {}", transport, e)))?;
-
-    // 握手.
-    jsonl::send_hello(&mut stream, &jsonl::Hello::new())
-        .await
-        .map_err(|e| CtlError::Msg(e.to_string()))?;
-    let hello = jsonl::recv_hello(&mut stream)
-        .await
-        .map_err(|e| CtlError::Msg(e.to_string()))?;
-    jsonl::check_version(&hello).map_err(|e| CtlError::Msg(e.to_string()))?;
+async fn run(command: SdReq, command_name: &str, instance: Instance) -> Result<u8, CtlError> {
+    let mut stream = connect(&instance).await.map_err(CtlError::Msg)?;
 
     // 发送命令.
-    jsonl::send_frame(&mut stream, &jsonl::Frame::Command(command.clone()))
+    let line = encode_frame(&command).map_err(|e| CtlError::Msg(e.to_string()))?;
+    stream
+        .send(line)
         .await
         .map_err(|e| CtlError::Msg(e.to_string()))?;
 
     // 接收响应 并 格式化输出.
-    match jsonl::recv_frame(&mut stream)
+    let line = stream
+        .recv()
         .await
-        .map_err(|e| CtlError::Msg(e.to_string()))?
-    {
-        jsonl::Frame::Response(resp) => Ok(print_response(&command, resp)),
-        _ => Err(CtlError::Msg("unexpected frame from init".into())),
-    }
+        .map_err(|e| CtlError::Msg(e.to_string()))?;
+    let resp: SdRes = decode_frame(&line).map_err(|e| CtlError::Msg(e.to_string()))?;
+    Ok(print_response(command_name, &command, resp))
 }
 
-/// 格式化/打印 响应, 返回 是否成功.
-fn print_response(cmd: &Command, resp: Response) -> bool {
-    match resp {
-        Response::Ok => {
-            if let Some(m) = action_ok_message(cmd) {
-                println!("{}", m);
-            }
-            true
-        }
-        Response::Err { message } => {
-            eprintln!("{}", message);
-            false
-        }
-        Response::ListUnits { units } => {
-            print_list_units(&units);
-            true
-        }
-        Response::Status { status } => {
-            print_status(&status);
-            true
-        }
-        Response::Config { config } => {
-            print_config(cmd, &config);
-            true
-        }
-        Response::Bool { value } => {
-            print_bool(cmd, value);
-            true
-        }
-        Response::EnableState { state } => {
-            println!("{}", enable_state_str(state));
-            true
-        }
-        Response::DefaultTarget { target } => {
-            println!("{}", target);
-            true
-        }
-        Response::Dependencies { deps } => {
-            for d in &deps {
-                println!("{}", d);
-            }
-            true
-        }
-        Response::Timers { timers } => {
-            print_timers(&timers);
-            true
-        }
-        Response::Logs { .. } => {
-            // ctl 不会请求日志; 视为协议异常.
-            eprintln!("unexpected response: logs");
-            false
-        }
-    }
-}
-
-/// 操作成功时 的 提示消息 (大部分动作 静默成功, 与 systemctl 风格一致).
-fn action_ok_message(cmd: &Command) -> Option<String> {
-    use Command as C;
-    match cmd {
-        C::Enable { unit, .. } => Some(format!("Enabled {}.", unit)),
-        C::Disable { unit, .. } => Some(format!("Disabled {}.", unit)),
-        C::Reenable { unit } => Some(format!("Reenabled {}.", unit)),
-        C::Mask { unit } => Some(format!("Masked {}.", unit)),
-        C::Unmask { unit } => Some(format!("Unmasked {}.", unit)),
-        C::SetDefault { target } => Some(format!("Default target set to {}.", target)),
-        C::DaemonReload => Some("Reloaded configuration.".to_string()),
-        C::ResetFailed { unit: Some(u) } => Some(format!("Reset failed state of {}.", u)),
-        C::ResetFailed { unit: None } => Some("Reset all failed states.".to_string()),
-        _ => None,
-    }
-}
-
-/// 打印 `list-units` 结果.
-fn print_list_units(units: &[UnitInfo]) {
-    println!("UNIT LOAD ACTIVE SUB DESCRIPTION");
-    for u in units {
-        println!(
-            "{} loaded {} {} {}",
-            u.name,
-            active_str(u.active),
-            sub_str(u.sub),
-            u.description
-        );
-    }
-}
-
-/// 打印 `status` 结果.
-fn print_status(s: &UnitStatus) {
-    println!("{} - {}", s.name, s.description);
-    let load = if s.masked {
-        "masked"
-    } else if s.enabled {
-        "enabled"
-    } else {
-        "disabled"
-    };
-    println!("   Loaded: {} ({})", "loaded", load);
-    match s.pid {
-        Some(pid) => println!(
-            "   Active: {} ({}) (pid {})",
-            active_str(s.active),
-            sub_str(s.sub),
-            pid
-        ),
-        None => println!("   Active: {} ({})", active_str(s.active), sub_str(s.sub)),
-    }
-    if s.restart_count > 0 {
-        println!("   Restarts: {}", s.restart_count);
-    }
-    if let Some(code) = s.exit_status {
-        println!("   ExitStatus: {}", code);
-    }
-}
-
-/// 打印 `show` / `cat` 结果.
-fn print_config(cmd: &Command, c: &UnitConfig) {
-    match cmd {
-        Command::Show { .. } => {
-            println!("Name={}", c.name);
-            println!("Description={}", c.description);
-            println!("Type={}", c.service_type);
-            println!("ExecStart={}", c.exec_start);
-            if let Some(s) = &c.exec_stop {
-                println!("ExecStop={}", s);
-            }
-            if let Some(r) = &c.exec_reload {
-                println!("ExecReload={}", r);
-            }
-            println!("Restart={}", c.restart);
-            println!("RestartSec={}", c.restart_sec);
-            println!("WantedBy={}", c.wanted_by.as_deref().unwrap_or(""));
-        }
-        _ => {
-            println!("[Unit]");
-            println!("Description={}", c.description);
-            println!("[Service]");
-            println!("ExecStart={}", c.exec_start);
-            if let Some(s) = &c.exec_stop {
-                println!("ExecStop={}", s);
-            }
-            if let Some(r) = &c.exec_reload {
-                println!("ExecReload={}", r);
-            }
-            println!("Restart={}", c.restart);
-            println!("RestartSec={}", c.restart_sec);
-        }
-    }
-}
-
-/// 打印 布尔结果 (is-active / is-failed).
-fn print_bool(cmd: &Command, value: bool) {
-    match cmd {
-        Command::IsActive { .. } => println!("{}", if value { "active" } else { "inactive" }),
-        Command::IsFailed { .. } => println!("{}", if value { "failed" } else { "inactive" }),
-        _ => println!("{}", value),
-    }
-}
-
-/// 打印 timer 列表.
-fn print_timers(timers: &[TimerInfo]) {
-    if timers.is_empty() {
-        println!("0 timers listed.");
-    } else {
-        for t in timers {
-            println!("{}", t.name);
-        }
-    }
-}
-
-/// `ActiveState` -> 显示文本.
-fn active_str(s: ActiveState) -> &'static str {
-    match s {
-        ActiveState::Active => "active",
-        ActiveState::Inactive => "inactive",
-        ActiveState::Failed => "failed",
-    }
-}
-
-/// `SubState` -> 显示文本.
-fn sub_str(s: SubState) -> &'static str {
-    match s {
-        SubState::Running => "running",
-        SubState::Exited => "exited",
-        SubState::Dead => "dead",
-        SubState::Failed => "failed",
-    }
-}
-
-/// `EnableState` -> 显示文本.
-fn enable_state_str(s: EnableState) -> &'static str {
-    match s {
-        EnableState::Enabled => "enabled",
-        EnableState::Disabled => "disabled",
-        EnableState::Masked => "masked",
-    }
-}
+/// 格式化/打印 响应, 返回 进程退出码.
 
 /// 打印 帮助.
 fn print_help() {

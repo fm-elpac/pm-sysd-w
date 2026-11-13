@@ -4,122 +4,162 @@
 //!
 //! IPC 使用 命名管道 (Named pipe): 只允许本机程序连接 (默认 `reject_remote_clients`),
 //! 禁止网络连接. 使用 `first_pipe_instance` 进行实例唯一性检测.
+//!
+//! 本模块 只包含 平台相关 代码, 不做 抽象/封装.
 
+use std::{env, process, time::Duration};
+
+use tokio::{
+    net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer},
+    process::Command,
+    time::{Instant, sleep},
+};
+use windows::Win32::{
+    Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND},
+    System::Threading::CREATE_NO_WINDOW,
+};
+
+use crate::pa::{IpcAcl, SpawnOptions};
+
+pub mod acl;
 pub mod console;
+
 mod error;
+
 #[cfg(test)]
 mod test;
 
 pub use error::PwError;
 
-use std::time::Duration;
+use acl::{PipeAcl, create_server, pipe_exists};
 
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+/// 客户端 连接流.
+pub type ClientStream = NamedPipeClient;
 
-use crate::pa::{BoxFuture, BoxStream, Pa, PaError, PaListener, SpawnOptions};
+/// 服务端 连接流.
+pub type ServerStream = NamedPipeServer;
 
-/// Windows 平台实现.
-#[derive(Debug, Clone, Default)]
-pub struct PaW;
+/// 命名管道 监听器.
+///
+/// 使用 tokio 文档推荐的模式: 始终保有 一个未连接的 server 实例, 避免客户端
+/// 连接时出现 `NotFound`.
+pub struct Listener {
+    /// 完整管道地址.
+    addr: String,
+    /// 管道 DACL 权限级别.
+    acl: PipeAcl,
+    /// 当前等待连接的 server 实例.
+    pending: Option<NamedPipeServer>,
+}
 
-impl Pa for PaW {
-    fn name(&self) -> &'static str {
-        "windows"
-    }
-
-    fn spawn_flags(&self, cmd: &mut tokio::process::Command, opts: SpawnOptions) {
-        if opts.create_no_window {
-            cmd.creation_flags(CREATE_NO_WINDOW.0);
-        }
-    }
-
-    fn ipc_listen(&self, path: &str) -> Result<Box<dyn PaListener>, PaError> {
-        Ok(Box::new(PipeListener::new(path)?))
-    }
-
-    fn ipc_connect(&self, path: &str) -> BoxFuture<'static, Result<BoxStream, PaError>> {
-        let pipe_name = pipe_addr(path);
-        Box::pin(async move {
-            // 简单实现: 连接 失败时 短暂重试 (服务器 可能在 替换 pipe 实例).
-            let mut last = None;
-            for _ in 0..100 {
-                match ClientOptions::new().open(&pipe_name) {
-                    Ok(c) => return Ok(Box::new(c) as BoxStream),
-                    Err(e) => last = Some(e),
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(PaError::Ipc(format!(
-                "connect pipe `{}`: {:?}",
-                pipe_name, last
-            )))
+impl Listener {
+    /// 创建 命名管道 监听器.
+    ///
+    /// 第一个实例 使用 `first_pipe_instance(true)` 检测 是否已有同名实例.
+    pub fn bind(name: &str, acl: PipeAcl) -> Result<Self, PwError> {
+        let addr = pipe_addr(name);
+        let pending = create_server(&addr, true, acl)?;
+        Ok(Self {
+            addr,
+            acl,
+            pending: Some(pending),
         })
+    }
+
+    /// 接受 下一个连接.
+    pub async fn accept(&mut self) -> Result<ServerStream, PwError> {
+        let server = match self.pending.take() {
+            Some(s) => s,
+            None => {
+                return Err(PwError::Ipc("pipe listener exhausted".to_string()));
+            }
+        };
+
+        // 先创建替代 server (非 first), 保证连接窗口不中断.
+        match create_server(&self.addr, false, self.acl) {
+            Ok(next) => self.pending = Some(next),
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
+        server
+            .connect()
+            .await
+            .map_err(|e| PwError::Ipc(format!("pipe connect: {}", e)))?;
+        Ok(server)
+    }
+}
+
+/// 连接 命名管道.
+///
+/// 快速失败: 总耗时 最多 200ms. 服务器 可能在替换 pipe 实例, 仅在
+/// ERROR_PIPE_BUSY 时 短暂重试; 不存在 / 权限不足 直接返回.
+pub async fn connect(name: &str) -> Result<ClientStream, PwError> {
+    let pipe_name = pipe_addr(name);
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        match ClientOptions::new().open(&pipe_name) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                let code = e.raw_os_error();
+                if code == Some(ERROR_FILE_NOT_FOUND.0 as i32) {
+                    return Err(PwError::NotFound(format!(
+                        "connect pipe `{}`: not found",
+                        pipe_name
+                    )));
+                }
+                if code == Some(ERROR_ACCESS_DENIED.0 as i32) {
+                    return Err(PwError::Permission(format!(
+                        "connect pipe `{}`: access denied",
+                        pipe_name
+                    )));
+                }
+                if Instant::now() >= deadline {
+                    return Err(PwError::Ipc(format!(
+                        "connect pipe `{}`: os error {:?}",
+                        pipe_name, code
+                    )));
+                }
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 检查 命名管道 是否存在.
+pub fn exists(name: &str) -> bool {
+    pipe_exists(&pipe_addr(name))
+}
+
+/// 平台特定 的 进程创建 标志.
+pub fn spawn_flags(cmd: &mut Command, opts: SpawnOptions) {
+    if opts.create_no_window {
+        cmd.creation_flags(CREATE_NO_WINDOW.0);
+    }
+}
+
+/// 重启自身 (soft-reboot): 启动 新进程 后 当前进程 自行退出.
+pub fn soft_reboot(args: &[String]) -> Result<(), PwError> {
+    let exe = env::current_exe().map_err(|e| PwError::Msg(format!("current_exe: {}", e)))?;
+    match process::Command::new(&exe).args(args).spawn() {
+        Ok(_) => Ok(()),
+        Err(e) => Err(PwError::Msg(format!("soft-reboot spawn: {}", e))),
+    }
+}
+
+/// `IpcAcl` -> `PipeAcl`.
+impl From<IpcAcl> for PipeAcl {
+    fn from(acl: IpcAcl) -> Self {
+        match acl {
+            IpcAcl::System => PipeAcl::System,
+            IpcAcl::SystemReadOnly => PipeAcl::SystemReadOnly,
+            IpcAcl::CurrentUser => PipeAcl::CurrentUser,
+        }
     }
 }
 
 /// 命名管道 完整地址 (`\\.\pipe\NAME`).
 fn pipe_addr(name: &str) -> String {
     format!(r"\\.\pipe\{}", name)
-}
-
-/// 创建 一个 命名管道 服务器.
-fn create_server(addr: &str, first: bool) -> Result<NamedPipeServer, PaError> {
-    let mut opts = ServerOptions::new();
-    // `first_pipe_instance(true)` 用于 实例唯一性检测.
-    opts.first_pipe_instance(first);
-    opts.create(addr)
-        .map_err(|e| PaError::Ipc(format!("create pipe `{}`: {}", addr, e)))
-}
-
-/// Windows 命名管道 监听器.
-///
-/// 使用 tokio 文档推荐的 模式: 始终保有 一个 未连接 的 server 实例, 避免 客户端
-/// 连接时 出现 `NotFound`.
-struct PipeListener {
-    /// 完整管道地址.
-    addr: String,
-    /// 当前等待连接的 server 实例.
-    pending: Option<NamedPipeServer>,
-}
-
-impl PipeListener {
-    fn new(name: &str) -> Result<Self, PaError> {
-        let addr = pipe_addr(name);
-        // 第一个实例 使用 `first_pipe_instance(true)` 检测 是否已有同名实例.
-        let pending = create_server(&addr, true)?;
-        Ok(Self {
-            addr,
-            pending: Some(pending),
-        })
-    }
-}
-
-impl PaListener for PipeListener {
-    fn accept<'a>(&'a mut self) -> BoxFuture<'a, Result<BoxStream, PaError>> {
-        let server = match self.pending.take() {
-            Some(s) => s,
-            None => {
-                return Box::pin(async {
-                    Err(PaError::Ipc("pipe listener exhausted".to_string()))
-                });
-            }
-        };
-
-        // 先创建 替代 server (非 first), 保证 连接窗口 不中断.
-        match create_server(&self.addr, false) {
-            Ok(next) => self.pending = Some(next),
-            Err(e) => {
-                return Box::pin(async move { Err(e) });
-            }
-        }
-
-        Box::pin(async move {
-            server
-                .connect()
-                .await
-                .map_err(|e| PaError::Ipc(format!("pipe connect: {}", e)))?;
-            Ok(Box::new(server) as BoxStream)
-        })
-    }
 }

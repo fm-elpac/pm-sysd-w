@@ -2,71 +2,89 @@
 //!
 //! 仅用于方便测试 (Linux 上已有 systemd, pm-sysd-w 几乎无用).
 //!
-//! IPC 使用 当前目录 的 UNIX socket.
+//! IPC 使用 UNIX socket. 本模块 只包含 平台相关 代码, 不做 抽象/封装.
+
+use std::{
+    env, fs, io,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use tokio::net::{UnixListener, UnixStream};
 
 mod error;
+
 #[cfg(test)]
 mod test;
 
 pub use error::PuError;
 
-use std::path::PathBuf;
+/// 客户端 连接流 (Linux 上 与服务端 同类型).
+pub type ClientStream = UnixStream;
 
-use tokio::net::{UnixListener, UnixStream};
+/// 服务端 连接流.
+pub type ServerStream = UnixStream;
 
-use crate::pa::{BoxFuture, BoxStream, Pa, PaError, PaListener};
-
-/// Linux 平台实现.
-#[derive(Debug, Clone, Default)]
-pub struct PaU;
-
-impl Pa for PaU {
-    fn name(&self) -> &'static str {
-        "linux"
-    }
-
-    fn ipc_listen(&self, path: &str) -> Result<Box<dyn PaListener>, PaError> {
-        // 直接 bind: 若路径已存在 (同名实例 已运行), bind 会失败, 即 实例唯一性检测.
-        let inner = UnixListener::bind(path)
-            .map_err(|e| PaError::Ipc(format!("bind `{}`: {}", path, e)))?;
-        Ok(Box::new(UListener {
-            path: PathBuf::from(path),
-            inner,
-        }))
-    }
-
-    fn ipc_connect(&self, path: &str) -> BoxFuture<'static, Result<BoxStream, PaError>> {
-        let path = path.to_string();
-        Box::pin(async move {
-            let s = UnixStream::connect(&path)
-                .await
-                .map_err(|e| PaError::Ipc(format!("connect `{}`: {}", path, e)))?;
-            Ok(Box::new(s) as BoxStream)
-        })
-    }
-}
-
-/// Linux UNIX socket 监听器.
+/// UNIX socket 监听器.
 ///
-/// 被 Drop 时 删除 socket 文件 (pm-sysd-init 正常退出 与 测试 结束时 自动清理).
-struct UListener {
+/// 被 Drop 时删除 socket 文件 (pm-sysd-init 正常退出与测试结束时自动清理).
+pub struct Listener {
     /// socket 文件 路径.
     path: PathBuf,
     inner: UnixListener,
 }
 
-impl PaListener for UListener {
-    fn accept<'a>(&'a mut self) -> BoxFuture<'a, Result<BoxStream, PaError>> {
-        let fut = self.inner.accept();
-        Box::pin(async move {
-            let (stream, _) = fut.await.map_err(|e| PaError::Ipc(e.to_string()))?;
-            Ok(Box::new(stream) as BoxStream)
+impl Listener {
+    /// 绑定 UNIX socket. 路径已存在时 失败 (实例唯一性检测).
+    pub fn bind(path: &str) -> Result<Self, PuError> {
+        let inner = UnixListener::bind(path)
+            .map_err(|e| PuError::Ipc(format!("bind `{}`: {}", path, e)))?;
+        Ok(Self {
+            path: PathBuf::from(path),
+            inner,
         })
+    }
+
+    /// 接受 下一个连接.
+    pub async fn accept(&mut self) -> Result<ServerStream, PuError> {
+        let (stream, _) = self
+            .inner
+            .accept()
+            .await
+            .map_err(|e| PuError::Ipc(e.to_string()))?;
+        Ok(stream)
     }
 }
 
-impl Drop for UListener {
+impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // 删除 UNIX socket 文件 失败时 无法向上传播 (Drop 无返回值), 尽力而为, 忽略.
+        let _ = fs::remove_file(&self.path);
     }
+}
+
+/// 连接 UNIX socket.
+pub async fn connect(path: &str) -> Result<ClientStream, PuError> {
+    UnixStream::connect(path).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            PuError::NotFound(format!("connect `{}`: {}", path, e))
+        } else if e.kind() == io::ErrorKind::PermissionDenied {
+            PuError::Permission(format!("connect `{}`: {}", path, e))
+        } else {
+            PuError::Ipc(format!("connect `{}`: {}", path, e))
+        }
+    })
+}
+
+/// 检查 UNIX socket 文件 是否存在.
+pub fn exists(path: &str) -> bool {
+    Path::new(path).exists()
+}
+
+/// 重启自身 (soft-reboot): `exec` 替换当前进程, 失败时返回错误.
+pub fn soft_reboot(args: &[String]) -> Result<(), PuError> {
+    let exe = env::current_exe().map_err(|e| PuError::Msg(format!("current_exe: {}", e)))?;
+    let e = Command::new(&exe).args(args).exec();
+    Err(PuError::Msg(format!("soft-reboot exec: {}", e)))
 }

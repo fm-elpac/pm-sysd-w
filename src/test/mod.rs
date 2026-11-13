@@ -1,7 +1,9 @@
-//! 测试 公共工具 (临时目录).
+//! 整个 pm-sysd-w 的 集成测试 公共工具 (临时目录).
 
 use std::{
+    env, fs,
     path::{Path, PathBuf},
+    process,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -17,14 +19,7 @@ fn uid() -> u64 {
 /// - Windows: `%TEMP%` (系统临时目录).
 /// - 其它平台: `std::env::temp_dir()`.
 fn temp_base() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/tmp")
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        std::env::temp_dir()
-    }
+    env::temp_dir()
 }
 
 /// 自动清理 的 临时目录 (RAII guard).
@@ -38,13 +33,8 @@ pub struct TempDir {
 impl TempDir {
     /// 在 系统临时目录 中 新建一个 唯一 子目录.
     pub fn new(prefix: &str) -> Self {
-        let path = temp_base().join(format!(
-            "pm_sysd_w_{}_{}_{}",
-            prefix,
-            std::process::id(),
-            uid()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = temp_base().join(format!("pm_sysd_w_{}_{}_{}", prefix, process::id(), uid()));
+        fs::create_dir_all(&path).unwrap();
         Self { path }
     }
 
@@ -56,6 +46,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // 清理临时目录 失败时 无法向上传播 (Drop 无返回值), 尽力而为, 忽略.
+        let _ = fs::remove_dir_all(&self.path);
     }
 }

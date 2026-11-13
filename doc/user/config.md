@@ -22,15 +22,21 @@ pm_tc = 1
 每个 `[[t.sysd]]` 定义一个 unit (初版仅支持 `service` 类型). 配置通过 `env:XXX`
 字段传入, 字段名与 systemd unit 文件的段/键 类似.
 
+注意: 这里的 `service` 不是 Windows 的 service (Windows 服务), 而是 pm-sysd-w
+的一种 unit 类型, 概念类似 systemd 的 service. 它实际表现为由 `pm-sysd-init`
+启动的一个 (或一组) 进程.
+
 bool 字段支持 systemd 布尔语法: `1` / `yes` / `true` / `on` 表示 正值, `0` /
 `no` / `false` / `off` 表示 负值.
 
 ### `env:Unit.*` (通用)
 
-| 字段                   | 类型   | 必填 | 默认 | 说明                            |
-| ---------------------- | ------ | ---- | ---- | ------------------------------- |
-| `env:Unit`             | 字符串 | 是   | -    | unit 名称, 须以 `.service` 结尾 |
-| `env:Unit.Description` | 字符串 | 否   | 空   | 描述                            |
+| 字段                             | 类型     | 必填 | 默认 | 说明                                                                            |
+| -------------------------------- | -------- | ---- | ---- | ------------------------------------------------------------------------------- |
+| `env:Unit`                       | 字符串   | 是   | -    | unit 名称, 当前版本须以 `.service` 结尾 (`.timer` / `.target` 已识别但尚未实现) |
+| `env:Unit.Description`           | 字符串   | 否   | 空   | 描述                                                                            |
+| `env:Unit.StartLimitIntervalSec` | 非负整数 | 否   | `10` | 启动限流时间窗口 (秒), 当前仅解析, 暂不生效                                     |
+| `env:Unit.StartLimitBurst`       | 非负整数 | 否   | `5`  | 启动限流次数, 当前仅解析, 暂不生效                                              |
 
 ### `env:Service.*`
 
@@ -65,9 +71,9 @@ bool 字段支持 systemd 布尔语法: `1` / `yes` / `true` / `on` 表示 正�
 
 ### `env:Install.*`
 
-| 字段                   | 类型   | 必填 | 默认 | 说明                                                       |
-| ---------------------- | ------ | ---- | ---- | ---------------------------------------------------------- |
-| `env:Install.WantedBy` | 字符串 | 否   | 空   | 所属 target (仅内置 target); 显式设置后该 unit 才可 enable |
+| 字段                   | 类型   | 必填 | 默认 | 说明                                                               |
+| ---------------------- | ------ | ---- | ---- | ------------------------------------------------------------------ |
+| `env:Install.WantedBy` | 字符串 | 否   | 空   | 所属 target (仅内置 target); 初版只有 `default.target` 才可 enable |
 
 ### `env:Win.*` (pm-sysd-w 专属)
 
@@ -94,4 +100,7 @@ bool 字段支持 systemd 布尔语法: `1` / `yes` / `true` / `on` 表示 正�
 - 仅 `service` unit 类型; 不支持 timer 等其它类型.
 - 不支持 unit 间依赖关系.
 - 不支持自定义 target.
-- 未列出的字段初版暂不实现 (可忽略或保留).
+- 未列出的字段初版暂不实现: 以 `Unit.` / `Service.` / `Install.` / `Timer.` /
+  `Win.` 开头 且未列出的字段, 在 init 启动加载配置与 daemon-reload 时会输出
+  `log::warn!()` 警告并写入日志 (可用 pm-sysd-log 查看), 然后忽略; 其余字段
+  静默忽略.

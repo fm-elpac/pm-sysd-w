@@ -5,133 +5,27 @@
 //!
 //! 配置格式参考 `doc/user/config.md`.
 
-mod error;
-#[cfg(test)]
-mod test;
-
-pub use error::ConfError;
-
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fs,
     path::{Path, PathBuf},
 };
 
 use pm_tc::{
-    conf::{ReadConfFile, SrcInfo, load},
-    task::{self, CheckEnv},
+    conf::{HasP, ReadConfFile, SrcInfo, load},
+    task::{CheckEnv, env_builtin, plan},
+    te::{PmtcEnv, exec_eval_2},
 };
 
-/// service 启动类型.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceType {
-    /// 默认: 启动即视为 active.
-    Simple,
-    /// 进程退出 (成功) 视为启动完成, 不持续运行.
-    Oneshot,
-}
+mod error;
+mod types;
 
-impl ServiceType {
-    /// 配置关键字 (用于 显示/序列化).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Simple => "simple",
-            Self::Oneshot => "oneshot",
-        }
-    }
-}
+#[cfg(test)]
+mod test;
 
-/// 重启策略.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestartPolicy {
-    /// 不自动重启 (默认).
-    No,
-    /// 退出后总是重启.
-    Always,
-    /// 仅异常退出时重启.
-    OnFailure,
-}
-
-impl RestartPolicy {
-    /// 配置关键字 (用于 显示/序列化).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::No => "no",
-            Self::Always => "always",
-            Self::OnFailure => "on-failure",
-        }
-    }
-}
-
-/// `[Service]` 节 配置.
-#[derive(Debug, Clone)]
-pub struct Service {
-    /// 启动类型
-    pub service_type: ServiceType,
-    /// 启动命令
-    pub exec_start: String,
-    /// 停止命令
-    pub exec_stop: Option<String>,
-    /// reload 命令
-    pub exec_reload: Option<String>,
-    /// 重启策略
-    pub restart: RestartPolicy,
-    /// 重启间隔 (秒)
-    pub restart_sec: u32,
-    /// 启动超时 (秒)
-    pub timeout_start_sec: u32,
-    /// 停止超时 (秒)
-    pub timeout_stop_sec: u32,
-    /// 工作目录
-    pub working_directory: Option<String>,
-    /// 环境变量 (`KEY=VALUE` 列表)
-    pub environment: Vec<(String, String)>,
-    /// 进程退出后是否仍视为 active
-    pub remain_after_exit: bool,
-}
-
-/// `[Install]` 节 配置.
-#[derive(Debug, Clone)]
-pub struct Install {
-    /// 所属 target (显式设置后该 unit 才可 enable)
-    pub wanted_by: Option<String>,
-}
-
-/// `[Win]` 节 配置 (pm-sysd-w 专属扩展).
-#[derive(Debug, Clone, Copy)]
-pub struct Win {
-    /// 启动进程时 设置 CREATE_NO_WINDOW 标志 (console 程序不显示 黑窗口).
-    ///
-    /// 仅 Windows 平台有效, Linux 上 忽略.
-    pub create_no_window: bool,
-}
-
-/// 一个 unit (service) 的配置 (模仿 systemd unit 文件 的 节).
-#[derive(Debug, Clone)]
-pub struct Unit {
-    /// unit 名称 (例如 `test-run.service`)
-    pub name: String,
-    /// 描述
-    pub description: String,
-    /// `[Service]` 节
-    pub service: Service,
-    /// `[Install]` 节
-    pub install: Install,
-    /// `[Win]` 节 (pm-sysd-w 专属扩展)
-    pub win: Win,
-}
-
-/// 加载配置文件 得到的结果.
-#[derive(Debug, Clone)]
-pub struct Conf {
-    /// 所有 unit (service) 配置
-    pub units: Vec<Unit>,
-    /// sqlite 数据库路径 (绝对路径)
-    pub db_path: String,
-    /// 主配置文件所在目录 (绝对路径)
-    pub conf_dir: String,
-}
+pub use error::ConfError;
+pub use types::{Conf, Install, RestartPolicy, Service, ServiceType, Unit, UnitType, Win};
 
 /// 读取配置文件 的 默认实现.
 struct FsReader;
@@ -164,9 +58,10 @@ pub fn load_conf(conf_path: &str) -> Result<Conf, ConfError> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // (环境) 变量: 内置变量 + 系统环境变量 (与 pm-tc CLI 一致).
-    let mut env = task::env_builtin();
-    env.add(task::env_sys());
+    // (环境) 变量: 内置变量
+    let env = env_builtin();
+    // pm-sysd-w 不使用 环境变量 (当前版本)
+    //env.add(env_sys());
 
     // 加载 配置文件.
     let mut src = SrcInfo::new();
@@ -174,9 +69,15 @@ pub fn load_conf(conf_path: &str) -> Result<Conf, ConfError> {
     let c = load(conf_path, &mut rc, &mut src).map_err(|e| ConfError::Pm(e.to_string()))?;
 
     // 计划执行 (拿到 所有 `[[t.sysd]]` 实例的 最终变量).
+    // 空配置 (没有 任何 `[[t.sysd]]`) 也允许加载: 此时 传 空 task 列表.
+    let sysd_tasks = c.task.get("sysd").map(|v| v.as_slice()).unwrap_or(&[]);
+    let task: Vec<String> = if sysd_tasks.is_empty() {
+        Vec::new()
+    } else {
+        vec!["sysd".to_string()]
+    };
     let mut ce = FsChecker;
-    let task = vec!["sysd".to_string()];
-    let (_, pd) = task::plan(&task, &c, &env, &mut ce).map_err(|e| ConfError::Pm(e.to_string()))?;
+    let (_, pd) = plan(&task, &c, &env, &mut ce).map_err(|e| ConfError::Pm(e.to_string()))?;
 
     // 数据库 路径 (`[env] SYSD_DB`).
     let db_rel = pd
@@ -186,32 +87,62 @@ pub fn load_conf(conf_path: &str) -> Result<Conf, ConfError> {
         .unwrap_or_else(|| "pm_sysd_w_v1.db".to_string());
     let db_path = resolve_path(&conf_dir, &db_rel);
 
-    // 解析 每个 unit.
+    // 解析 每个 unit (命令字段 使用 pm-tc exec_eval 切分).
     let mut units = Vec::new();
-    for t in &pd.task {
-        units.push(parse_unit(&t.env)?);
+    let mut warnings = Vec::new();
+    for (t, ht) in pd.task.iter().zip(sysd_tasks.iter()) {
+        units.push(parse_unit(
+            &t.env,
+            &ht.as_ref().env,
+            c.eval_rec,
+            &mut warnings,
+        )?);
+    }
+
+    // 检测 重复 unit 名称 (名称 重复 视为 配置错误).
+    let mut seen = HashSet::new();
+    for u in &units {
+        if !seen.insert(u.name.as_str()) {
+            return Err(ConfError::BadUnit(format!("duplicate unit `{}`", u.name)));
+        }
     }
 
     Ok(Conf {
         units,
         db_path,
         conf_dir: conf_dir.to_string_lossy().into_owned(),
+        warnings,
     })
 }
 
-/// 从 pm-tc 任务 的 最终变量 解析出 一个 [`Unit`].
+/// 从 pm-tc 任务的最终变量解析出一个 [`Unit`].
 ///
 /// 变量名即 `env:XXX` 去掉前缀后的名称 (例如 `Unit`, `Service.ExecStart`).
-fn parse_unit(env: &BTreeMap<String, String>) -> Result<Unit, ConfError> {
+///
+/// `raw` 为配置文件中该 task 的原始 `env:XXX` 模板, 用于命令字段的
+/// [`exec_eval_2`] 解析; `r` 为 pm-tc 的递归深度上限.
+fn parse_unit(
+    env: &BTreeMap<String, String>,
+    raw: &HashMap<String, HasP<String>>,
+    r: u16,
+    warnings: &mut Vec<String>,
+) -> Result<Unit, ConfError> {
     let name = get_req(env, "Unit")?;
-    if !name.ends_with(".service") {
-        return Err(ConfError::BadUnit(format!(
-            "unit name `{}` must end with `.service`",
-            name
-        )));
+    let unit_type = parse_unit_type(&name)?;
+
+    // 对 `Unit.` / `Service.` / `Install.` / `Timer.` / `Win.` 开头且不支持的
+    // key 产生警告 (由调用方输出并写入日志); 其余 key 静默忽略.
+    for key in unsupported_keys(env) {
+        warnings.push(format!(
+            "unit `{}`: unsupported key `{}`; ignored",
+            name, key
+        ));
     }
 
     let description = get(env, "Unit.Description").unwrap_or("").to_string();
+    // 默认值 代码中写死; 用户在配置中指定时读取并解析.
+    let start_limit_interval_sec = get_u32(env, "Unit.StartLimitIntervalSec", "10")?;
+    let start_limit_burst = get_u32(env, "Unit.StartLimitBurst", "5")?;
 
     let service_type = match get(env, "Service.Type").unwrap_or("simple") {
         "simple" => ServiceType::Simple,
@@ -224,7 +155,25 @@ fn parse_unit(env: &BTreeMap<String, String>) -> Result<Unit, ConfError> {
         }
     };
 
-    let exec_start = get_req(env, "Service.ExecStart")?;
+    // 当前 task 的最终变量集 (供 exec_eval 展开命令模板).
+    let tenv = task_env(env);
+
+    let exec_start = {
+        let h = raw
+            .get("Service.ExecStart")
+            .ok_or_else(|| ConfError::BadUnit("missing `Service.ExecStart`".to_string()))?;
+        let argv = exec_eval_2(h.as_ref(), &tenv, r).map_err(|e| ConfError::Pm(e.to_string()))?;
+        if argv.is_empty() {
+            return Err(ConfError::BadUnit(format!(
+                "unit `{}`: Service.ExecStart is empty",
+                name
+            )));
+        }
+        argv
+    };
+
+    let exec_stop = exec_opt(raw.get("Service.ExecStop"), &tenv, r)?;
+    let exec_reload = exec_opt(raw.get("Service.ExecReload"), &tenv, r)?;
 
     let restart = match get(env, "Service.Restart").unwrap_or("no") {
         "no" => RestartPolicy::No,
@@ -244,12 +193,15 @@ fn parse_unit(env: &BTreeMap<String, String>) -> Result<Unit, ConfError> {
 
     Ok(Unit {
         name,
+        unit_type,
         description,
+        start_limit_interval_sec,
+        start_limit_burst,
         service: Service {
             service_type,
             exec_start,
-            exec_stop: get_nonempty(env, "Service.ExecStop"),
-            exec_reload: get_nonempty(env, "Service.ExecReload"),
+            exec_stop,
+            exec_reload,
             restart,
             restart_sec: get_u32(env, "Service.RestartSec", "1")?,
             timeout_start_sec: get_u32(env, "Service.TimeoutStartSec", "90")?,
@@ -265,12 +217,98 @@ fn parse_unit(env: &BTreeMap<String, String>) -> Result<Unit, ConfError> {
     })
 }
 
-/// 读取 变量值.
+/// 根据 unit 名称后缀解析 [`UnitType`].
+///
+/// 当前版本 只允许 `service`; `timer` / `target` 属于计划支持但尚未实现的
+/// 类型, 给出明确错误.
+fn parse_unit_type(name: &str) -> Result<UnitType, ConfError> {
+    if name.ends_with(".service") {
+        Ok(UnitType::Service)
+    } else if name.ends_with(".timer") {
+        Err(ConfError::BadUnit(format!(
+            "unit `{}`: timer units are not implemented yet",
+            name
+        )))
+    } else if name.ends_with(".target") {
+        Err(ConfError::BadUnit(format!(
+            "unit `{}`: custom target units are not supported",
+            name
+        )))
+    } else {
+        Err(ConfError::BadUnit(format!(
+            "unit `{}`: unsupported unit type (supported suffixes: .service, .timer, .target)",
+            name
+        )))
+    }
+}
+
+/// 本版本 已支持的 key.
+///
+/// 其余以 `Unit.`, `Service.`, `Install.`, `Timer.`, `Win.`
+/// 开头的 key 视为不支持.
+const SUPPORTED_KEYS: &[&str] = &[
+    "Unit.Description",
+    "Unit.StartLimitIntervalSec",
+    "Unit.StartLimitBurst",
+    "Service.Type",
+    "Service.ExecStart",
+    "Service.ExecStop",
+    "Service.ExecReload",
+    "Service.Restart",
+    "Service.RestartSec",
+    "Service.TimeoutStartSec",
+    "Service.TimeoutStopSec",
+    "Service.WorkingDirectory",
+    "Service.Environment",
+    "Service.RemainAfterExit",
+    "Install.WantedBy",
+    "Win.CreateNoWindow",
+];
+
+/// 返回 `env` 中以 `Unit.`, `Service.`, `Install.`, `Timer.`, `Win.`
+/// 开头且不在 [`SUPPORTED_KEYS`] 中的 key (已按 key 排序).
+fn unsupported_keys(env: &BTreeMap<String, String>) -> Vec<String> {
+    env.keys()
+        .filter(|k| {
+            k.starts_with("Unit.")
+                || k.starts_with("Service.")
+                || k.starts_with("Install.")
+                || k.starts_with("Timer.")
+                || k.starts_with("Win.")
+        })
+        .filter(|k| !SUPPORTED_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// 把当前 task 的最终变量转换为 pm-tc 变量集 (供 [`exec_eval_2`] 使用).
+fn task_env(env: &BTreeMap<String, String>) -> PmtcEnv {
+    let mut o = PmtcEnv::new();
+    for (k, v) in env {
+        o.set(k, v);
+    }
+    o
+}
+
+/// 解析可选命令 (缺失或切分后为空返回 `None`).
+fn exec_opt(
+    h: Option<&HasP<String>>,
+    env: &PmtcEnv,
+    r: u16,
+) -> Result<Option<Vec<String>>, ConfError> {
+    let Some(h) = h else {
+        return Ok(None);
+    };
+    let argv = exec_eval_2(h.as_ref(), env, r).map_err(|e| ConfError::Pm(e.to_string()))?;
+    Ok(if argv.is_empty() { None } else { Some(argv) })
+}
+
+/// 读取变量值.
 fn get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
     env.get(key).map(|s| s.as_str())
 }
 
-/// 读取 必需的 变量值 (非空).
+/// 读取必需的变量值 (非空).
 fn get_req(env: &BTreeMap<String, String>, key: &str) -> Result<String, ConfError> {
     match get_nonempty(env, key) {
         Some(v) => Ok(v),
@@ -278,14 +316,14 @@ fn get_req(env: &BTreeMap<String, String>, key: &str) -> Result<String, ConfErro
     }
 }
 
-/// 读取 非空 变量值.
+/// 读取非空变量值.
 fn get_nonempty(env: &BTreeMap<String, String>, key: &str) -> Option<String> {
     get(env, key)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
-/// 读取 非负整数 变量值 (带 默认值).
+/// 读取非负整数变量值 (带默认值).
 fn get_u32(env: &BTreeMap<String, String>, key: &str, default: &str) -> Result<u32, ConfError> {
     let s = get(env, key).unwrap_or(default);
     s.parse::<u32>().map_err(|_| {
@@ -293,10 +331,11 @@ fn get_u32(env: &BTreeMap<String, String>, key: &str, default: &str) -> Result<u
     })
 }
 
-/// 读取 布尔 变量值 (带 默认值).
+/// 读取布尔变量值 (带默认值).
 ///
-/// 支持 systemd 布尔语法: `1` / `yes` / `true` / `on` 为 true, `0` / `no` /
-/// `false` / `off` 为 false.
+/// 支持 systemd 布尔语法:
+/// `1`, `yes`, `true`, `on`.
+/// `0`, `no`, `false`, `off`.
 fn get_bool(env: &BTreeMap<String, String>, key: &str, default: bool) -> Result<bool, ConfError> {
     let s = match get(env, key) {
         Some(s) => s,
@@ -329,7 +368,7 @@ fn parse_environment(value: Option<&str>) -> Result<Vec<(String, String)>, ConfE
     }
 }
 
-/// 把 相对路径 解析为 相对 `base` 的 绝对路径.
+/// 把相对路径解析为相对 `base` 的绝对路径.
 fn resolve_path(base: &Path, p: &str) -> String {
     let path = Path::new(p);
     let full = if path.is_absolute() {

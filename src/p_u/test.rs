@@ -2,30 +2,26 @@
 
 use std::path::Path;
 
-use super::*;
-use crate::testutil::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::test::TempDir;
+
+use super::{Listener, connect};
 
 fn tmp_sock(dir: &TempDir) -> String {
     dir.path().join("a.sock").to_string_lossy().into_owned()
 }
 
-#[test]
-fn name() {
-    assert_eq!(PaU::default().name(), "linux");
-}
-
 #[tokio::test]
-async fn ipc_listen_unique_and_cleanup() {
+async fn bind_unique_and_cleanup() {
     let dir = TempDir::new("pu");
     let path = tmp_sock(&dir);
 
-    // 第一次 bind 成功, socket 文件 已创建.
-    let l1 = PaU::default().ipc_listen(&path).unwrap();
+    let l1 = Listener::bind(&path).unwrap();
     assert!(Path::new(&path).exists());
 
     // 同名实例 再次 bind 失败 (唯一性检测).
-    assert!(PaU::default().ipc_listen(&path).is_err());
+    assert!(Listener::bind(&path).is_err());
 
     // 释放监听器 后, socket 文件 被自动删除.
     drop(l1);
@@ -33,12 +29,12 @@ async fn ipc_listen_unique_and_cleanup() {
 }
 
 #[tokio::test]
-async fn ipc_connect_roundtrip() {
+async fn connect_roundtrip() {
     let dir = TempDir::new("pu");
     let path = tmp_sock(&dir);
-    let mut listener = PaU::default().ipc_listen(&path).unwrap();
+    let mut listener = Listener::bind(&path).unwrap();
 
-    let connect = PaU::default().ipc_connect(&path);
+    let connect = connect(&path);
     let (accepted, client) = tokio::join!(listener.accept(), connect);
     let mut server = accepted.unwrap();
     let mut client = client.unwrap();

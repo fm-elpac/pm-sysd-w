@@ -5,26 +5,31 @@
 //! 初版主要实现 `-eu UNIT` 的功能: 跳到日志末尾 (`-e`) 并按 unit 过滤 (`-u`),
 //! 输出格式模仿 journalctl 的 short 格式.
 
+use std::process::ExitCode;
+
+use chrono::{DateTime, Local};
+use tokio::runtime::Runtime;
+
+use crate::{
+    cli::{complete_unit, connect, resolve_instance, set_instance},
+    jsonl::{SdReq, SdReqLogQuery, SdReqLogRO, SdRes, SdResLogEntry, decode_frame, encode_frame},
+    pa::{Instance, hostname},
+};
+
 mod error;
+
 #[cfg(test)]
 mod test;
 
 pub use error::LogError;
-
-use std::process::ExitCode;
-
-use crate::{
-    jsonl::{self, Command, LogQuery, Response},
-    pa::{Instance, Pa},
-};
 
 /// 默认 最多读取条数.
 const DEFAULT_LIMIT: u32 = 1000;
 
 /// pm-sysd-log 命令行参数.
 struct Args {
-    /// 实例.
-    instance: Instance,
+    /// 实例 (未显式指定时为 `None`, 连接时 再解析默认实例).
+    instance: Option<Instance>,
     /// 按 unit 过滤 (`-u` / `--unit`).
     unit: Option<String>,
 }
@@ -46,7 +51,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
+    let rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("{}", e);
@@ -54,7 +59,17 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    match rt.block_on(run(args)) {
+    // 解析 实际连接的实例: 与 pm-sysd-ctl 一致, 未显式指定时优先 --system,
+    // 不存在则回退 --user.
+    let instance = match resolve_instance(args.instance) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{}", e);
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
+    match rt.block_on(run(args.unit, instance)) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("{}", e);
@@ -72,21 +87,21 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
     while i < a.len() {
         let arg = &a[i];
         match arg.as_str() {
-            "--system" => instance = Some(Instance::System),
-            "--user" => instance = Some(Instance::User),
+            "--system" => set_instance(&mut instance, Instance::System).map_err(LogError::Msg)?,
+            "--user" => set_instance(&mut instance, Instance::User).map_err(LogError::Msg)?,
             // `-e` (跳到末尾) 是默认行为, 接受并忽略.
             "-e" | "-x" | "-xe" | "--pager-end" | "--catalog" => {}
             // `-eu UNIT` / `-euUNIT`: `-e` + `-u` (unit 过滤).
             arg if arg.starts_with("-eu") => {
                 let rest = &arg[3..];
                 if !rest.is_empty() {
-                    unit = Some(rest.to_string());
+                    unit = Some(complete_unit(rest));
                 } else {
                     i += 1;
                     let v = a
                         .get(i)
                         .ok_or_else(|| LogError::Msg("-u needs UNIT".into()))?;
-                    unit = Some(v.clone());
+                    unit = Some(complete_unit(v));
                 }
             }
             "-u" | "--unit" => {
@@ -94,24 +109,27 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
                 let v = a
                     .get(i)
                     .ok_or_else(|| LogError::Msg("-u needs UNIT".into()))?;
-                unit = Some(v.clone());
+                unit = Some(complete_unit(v));
             }
             "-h" | "--help" => {}
             _ => {
                 if let Some(v) = arg.strip_prefix("--unit=") {
-                    unit = Some(v.to_string());
+                    unit = Some(complete_unit(v));
                 } else if let Some(v) = arg.strip_prefix("-u=") {
-                    unit = Some(v.to_string());
+                    unit = Some(complete_unit(v));
                 } else if let Some(v) = arg.strip_prefix("--machine=") {
-                    instance = Some(Instance::Machine(v.to_string()));
+                    set_instance(&mut instance, Instance::Machine(v.to_string()))
+                        .map_err(LogError::Msg)?;
                 } else if let Some(v) = arg.strip_prefix("-M=") {
-                    instance = Some(Instance::Machine(v.to_string()));
+                    set_instance(&mut instance, Instance::Machine(v.to_string()))
+                        .map_err(LogError::Msg)?;
                 } else if arg == "-M" {
                     i += 1;
                     let v = a
                         .get(i)
                         .ok_or_else(|| LogError::Msg("-M needs NAME".into()))?;
-                    instance = Some(Instance::Machine(v.clone()));
+                    set_instance(&mut instance, Instance::Machine(v.clone()))
+                        .map_err(LogError::Msg)?;
                 } else if arg.starts_with('-') {
                     return Err(LogError::Msg(format!("unknown option: {}", arg)));
                 } else {
@@ -122,57 +140,43 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
         i += 1;
     }
 
-    Ok(Args {
-        instance: instance.unwrap_or(Instance::System),
-        unit,
-    })
+    Ok(Args { instance, unit })
 }
 
 /// 主流程.
-async fn run(args: Args) -> Result<(), LogError> {
-    let pa = crate::Platform::default();
-    let transport = args.instance.transport();
-    let mut stream = pa
-        .ipc_connect(&transport)
-        .await
-        .map_err(|e| LogError::Msg(format!("connect `{}`: {}", transport, e)))?;
-
-    // 握手.
-    jsonl::send_hello(&mut stream, &jsonl::Hello::new())
-        .await
-        .map_err(|e| LogError::Msg(e.to_string()))?;
-    let hello = jsonl::recv_hello(&mut stream)
-        .await
-        .map_err(|e| LogError::Msg(e.to_string()))?;
-    jsonl::check_version(&hello).map_err(|e| LogError::Msg(e.to_string()))?;
+async fn run(unit: Option<String>, instance: Instance) -> Result<(), LogError> {
+    let mut stream = connect(&instance).await.map_err(LogError::Msg)?;
 
     // 发送日志查询命令.
-    let command = Command::Logs {
-        query: LogQuery {
-            unit: args.unit,
-            limit: DEFAULT_LIMIT,
-        },
-    };
-    jsonl::send_frame(&mut stream, &jsonl::Frame::Command(command))
+    let command = SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
+        unit,
+        limit: DEFAULT_LIMIT,
+        cursor: None,
+    }));
+    let line = encode_frame(&command).map_err(|e| LogError::Msg(e.to_string()))?;
+    stream
+        .send(line)
         .await
         .map_err(|e| LogError::Msg(e.to_string()))?;
 
     // 接收响应 并 打印.
-    match jsonl::recv_frame(&mut stream)
+    let line = stream
+        .recv()
         .await
-        .map_err(|e| LogError::Msg(e.to_string()))?
-    {
-        jsonl::Frame::Response(Response::Logs { logs }) => {
+        .map_err(|e| LogError::Msg(e.to_string()))?;
+    let resp: SdRes = decode_frame(&line).map_err(|e| LogError::Msg(e.to_string()))?;
+    match resp {
+        SdRes::Logs { logs, .. } => {
             print_logs(&logs);
             Ok(())
         }
-        jsonl::Frame::Response(Response::Err { message }) => Err(LogError::Msg(message)),
-        _ => Err(LogError::Msg("unexpected frame from init".into())),
+        SdRes::Err(message) => Err(LogError::Msg(message)),
+        _ => Err(LogError::Msg("unexpected response from init".into())),
     }
 }
 
 /// 打印日志 (模仿 journalctl 的 short 格式).
-fn print_logs(logs: &[jsonl::LogEntry]) {
+fn print_logs(logs: &[SdResLogEntry]) {
     for e in logs {
         let program = e.unit.as_deref().unwrap_or("pm-sysd-w");
         println!("{} {} {}: {}", format_ts(&e.ts), hostname(), program, e.msg);
@@ -181,28 +185,12 @@ fn print_logs(logs: &[jsonl::LogEntry]) {
 
 /// 时间戳 (UTC ISO 8601) -> 本地时间 `MMM DD HH:MM:SS`.
 fn format_ts(ts: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(ts) {
+    match DateTime::parse_from_rfc3339(ts) {
         Ok(dt) => dt
-            .with_timezone(&chrono::Local)
+            .with_timezone(&Local)
             .format("%b %d %H:%M:%S")
             .to_string(),
         Err(_) => ts.to_string(),
-    }
-}
-
-/// 当前主机名.
-fn hostname() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_string())
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        "localhost".to_string()
     }
 }
 

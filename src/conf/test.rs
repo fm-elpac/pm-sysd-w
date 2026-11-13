@@ -1,7 +1,8 @@
 //! conf 模块测试.
 
-use super::*;
-use crate::testutil::TempDir;
+use crate::test::TempDir;
+
+use super::{RestartPolicy, ServiceType, UnitType, load_conf};
 
 /// 写入 配置文本 到 临时目录, 返回 配置文件 路径.
 fn write_conf(dir: &TempDir, text: &str) -> String {
@@ -59,8 +60,9 @@ pm_tc = 1
 
     let u = &conf.units[0];
     assert_eq!(u.name, "test-run.service");
+    assert_eq!(u.unit_type, UnitType::Service);
     assert_eq!(u.description, "Run a test program");
-    assert_eq!(u.service.exec_start, "path/to/bin --arg");
+    assert_eq!(u.service.exec_start, vec!["path/to/bin", "--arg"]);
     assert_eq!(u.service.restart, RestartPolicy::Always);
     assert_eq!(u.service.restart_sec, 10);
     assert_eq!(u.service.service_type, ServiceType::Simple);
@@ -78,6 +80,8 @@ fn defaults() {
     assert_eq!(u.service.service_type, ServiceType::Simple);
     assert_eq!(u.service.restart, RestartPolicy::No);
     assert_eq!(u.service.restart_sec, 1);
+    assert_eq!(u.start_limit_interval_sec, 10);
+    assert_eq!(u.start_limit_burst, 5);
     assert_eq!(u.service.timeout_start_sec, 90);
     assert_eq!(u.service.timeout_stop_sec, 90);
     assert!(u.service.working_directory.is_none());
@@ -87,6 +91,62 @@ fn defaults() {
     assert!(u.service.exec_reload.is_none());
     assert!(u.install.wanted_by.is_none());
     assert!(!u.win.create_no_window);
+    assert!(conf.db_path.ends_with("pm_sysd_w_v1.db"));
+}
+
+#[test]
+fn start_limit_fields() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Unit.StartLimitIntervalSec" = "60"
+"env:Unit.StartLimitBurst" = "10"
+"#,
+    );
+
+    let conf = load_conf(&path).unwrap();
+    // 用户 在配置中 指定时 读取并解析.
+    assert_eq!(conf.units[0].start_limit_interval_sec, 60);
+    assert_eq!(conf.units[0].start_limit_burst, 10);
+    // 已支持 的字段 不产生 警告.
+    assert!(
+        !conf
+            .warnings
+            .iter()
+            .any(|w| w.contains("StartLimitIntervalSec"))
+    );
+    assert!(!conf.warnings.iter().any(|w| w.contains("StartLimitBurst")));
+}
+
+#[test]
+fn bad_start_limit() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Unit.StartLimitIntervalSec" = "abc"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("StartLimitIntervalSec"));
+}
+
+#[test]
+fn empty_conf() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(&dir, "pm_tc = 1\n");
+
+    let conf = load_conf(&path).unwrap();
+    assert!(conf.units.is_empty());
     assert!(conf.db_path.ends_with("pm_sysd_w_v1.db"));
 }
 
@@ -119,8 +179,14 @@ pm_tc = 1
     let conf = load_conf(&path).unwrap();
     let u = &conf.units[0];
     assert_eq!(u.service.service_type, ServiceType::Oneshot);
-    assert_eq!(u.service.exec_stop.as_deref(), Some("stop"));
-    assert_eq!(u.service.exec_reload.as_deref(), Some("reload"));
+    assert_eq!(
+        u.service.exec_stop.as_deref(),
+        Some(&["stop".to_string()][..])
+    );
+    assert_eq!(
+        u.service.exec_reload.as_deref(),
+        Some(&["reload".to_string()][..])
+    );
     assert_eq!(u.service.restart, RestartPolicy::OnFailure);
     assert_eq!(u.service.restart_sec, 5);
     assert_eq!(u.service.timeout_start_sec, 10);
@@ -182,9 +248,29 @@ fn multiple_units() {
     let conf = load_conf(&path).unwrap();
     assert_eq!(conf.units.len(), 2);
     assert_eq!(conf.units[0].name, "a.service");
-    assert_eq!(conf.units[0].service.exec_start, "bin-a");
+    assert_eq!(conf.units[0].service.exec_start, vec!["bin-a"]);
     assert_eq!(conf.units[1].name, "b.service");
-    assert_eq!(conf.units[1].service.exec_start, "bin-b");
+    assert_eq!(conf.units[1].service.exec_start, vec!["bin-b"]);
+}
+
+#[test]
+fn duplicate_unit_name() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin-a"
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin-b"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("duplicate unit"));
 }
 
 #[test]
@@ -231,6 +317,38 @@ fn unit_name_must_end_with_service() {
     );
     let e = load_conf(&path).unwrap_err();
     assert!(e.to_string().contains(".service"));
+}
+
+#[test]
+fn timer_unit_not_implemented() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.timer"
+"env:Timer.OnCalendar" = "daily"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("timer"));
+}
+
+#[test]
+fn custom_target_not_supported() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "foo.target"
+"env:Service.ExecStart" = "bin"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("target"));
 }
 
 #[test]
@@ -409,4 +527,45 @@ fn enum_as_str() {
     assert_eq!(RestartPolicy::No.as_str(), "no");
     assert_eq!(RestartPolicy::Always.as_str(), "always");
     assert_eq!(RestartPolicy::OnFailure.as_str(), "on-failure");
+}
+
+#[test]
+fn unsupported_key_warnings() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Unit.After" = "x"
+"env:Service.FooBar" = "x"
+"env:Install.Alias" = "x"
+"env:Timer.OnCalendar" = "x"
+"env:Win.Other" = "x"
+"env:Other.Key" = "x"
+"#,
+    );
+
+    let conf = load_conf(&path).unwrap();
+    assert_eq!(conf.units.len(), 1);
+
+    let warnings = &conf.warnings;
+    for key in [
+        "Unit.After",
+        "Service.FooBar",
+        "Install.Alias",
+        "Timer.OnCalendar",
+        "Win.Other",
+    ] {
+        assert!(
+            warnings.iter().any(|w| w.contains(key)),
+            "missing warning for `{}`: {:?}",
+            key,
+            warnings
+        );
+    }
+    // 其余前缀的 key 静默忽略, 不产生警告.
+    assert!(!warnings.iter().any(|w| w.contains("Other.Key")));
 }

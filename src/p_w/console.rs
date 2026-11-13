@@ -1,7 +1,7 @@
 //! Windows 控制台 自适应.
 //!
-//! 本模块 是 p_w 中 唯一 允许 `unsafe` 的模块 (仅限 Win32 API 边界).
-
+//! 本模块 是 p_w 中 允许 `unsafe` 的两个模块之一 (另一个是 `acl`), 仅限
+//! Win32 API 边界.
 #![allow(unsafe_code)]
 
 use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList, GetConsoleWindow};
@@ -19,7 +19,7 @@ pub fn adjust_console() {
     let mut pids = [0u32; 2];
     let n = unsafe { GetConsoleProcessList(&mut pids) };
     if n == 1 {
-        // 断开失败 属 尽力而为, 忽略.
+        // 断开控制台 失败 仅影响 黑窗口显示, 属 尽力而为; 失败 忽略.
         let _ = unsafe { FreeConsole() };
     }
 }

@@ -16,21 +16,12 @@ pub mod logd;
 pub mod pa;
 pub mod sysd;
 
+#[cfg(target_os = "linux")]
+pub mod p_u;
 #[cfg(target_os = "windows")]
 pub mod p_w;
 
-#[cfg(target_os = "linux")]
-pub mod p_u;
-
 #[cfg(test)]
-mod testutil;
-
-/// 当前编译目标 的 平台实现 类型 (由 条件编译 确定).
-#[cfg(target_os = "linux")]
-pub type Platform = crate::p_u::PaU;
-
-/// 当前编译目标 的 平台实现 类型 (由 条件编译 确定).
-#[cfg(target_os = "windows")]
-pub type Platform = crate::p_w::PaW;
+mod test;
 
 pub use error::PmSysdWError;

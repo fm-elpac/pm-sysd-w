@@ -4,9 +4,15 @@ pm-sysd-w (PM Sysd (Windows)) is a systemd-style process manager for Windows.
 Use `pm-sysd-ctl` to manage processes (services) on Windows, similar to
 `systemctl`.
 
+Note: `service` in this documentation is not the Windows service concept. It is
+a pm-sysd-w unit type, similar to systemd's service concept; in practice it is
+one (or a group of) process(es) started by `pm-sysd-init`.
+
 ## Installation
 
 Requires the Rust toolchain (edition 2024).
+
+Only Windows 10 or newer is supported.
 
 ```sh
 cargo build --release
@@ -44,6 +50,34 @@ instance to operate on with `pm-sysd-ctl`'s instance option:
 | `--system`       | System instance | Usually runs as a Windows service, auto-starts at boot; requires admin |
 | `--user`         | User instance   | Auto-starts after the current user logs in                             |
 | `--machine=NAME` | Custom instance | Started manually, with a custom name                                   |
+
+Note: the current version does not include auto-start at boot (running as a
+Windows service) or auto-start after user login; these must be handled manually
+by the user. For example, pm-sysd-w will not automatically install
+`pm-sysd-init` as a Windows service, nor set up login auto-start; it only starts
+and manages services.
+
+`--system` / `--user` / `--machine=NAME` cannot be combined; specify only one.
+
+When `pm-sysd-ctl` / `pm-sysd-log` do not specify an instance option, they try
+`--system` first; if the system instance is not running, they automatically fall
+back to `--user`. This differs from systemd's default behavior. When connecting
+to `--system`, ordinary (non-administrator) users automatically use a read-only
+connection and can only make read-only queries (such as viewing logs / status).
+
+## Limitations on Windows Shutdown / Logoff
+
+Because of Windows limitations, on Windows shutdown or user logoff pm-sysd-w
+cannot guarantee (in practice, it is almost impossible to implement) a graceful
+service stop:
+
+- During shutdown / logoff, Windows does not allow starting new processes /
+  running new programs, so `ExecStop` most likely cannot run.
+- Recent Windows (Windows 10 / 11) cannot block shutdown; the system forces a
+  shutdown. Also, each program has only a very short fixed hard timeout (e.g. 5
+  seconds). That is, Windows waits at most 5 seconds for each program, then
+  force-terminates. This behavior cannot be configured, and programs cannot
+  change it.
 
 ## Config File
 
@@ -162,3 +196,20 @@ Common options:
 --user
 -M --machine=NAME
 ```
+
+## Log Notes
+
+- Logs are kept for the last 72 hours by default; pm-sysd-init runs an automatic
+  cleanup once per hour.
+- A service process's stdout / stderr is written line-by-line to that unit's
+  logs. Over-long lines are split into multiple log entries; output is not
+  guaranteed to be UTF-8, and on decode failure that line is replaced with one
+  error log entry written to the unit.
+
+## Graceful Exit
+
+- `pm-sysd-ctl ... exit` exits pm-sysd-init normally.
+- `pm-sysd-ctl ... soft-reboot` restarts pm-sysd-init itself and all managed
+  services (not a Windows reboot).
+- External signals: SIGTERM on Linux and Ctrl+C on Windows also trigger a
+  graceful exit.

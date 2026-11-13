@@ -24,15 +24,21 @@ Each `[[t.sysd]]` defines one unit (the initial version supports only the
 `service` type). Settings are passed via `env:XXX` fields, similar to systemd
 unit file section/key names.
 
+Note: `service` here is not the Windows service concept. It is a pm-sysd-w unit
+type, similar to systemd's service concept; in practice it is one (or a group
+of) process(es) started by `pm-sysd-init`.
+
 Boolean fields support the systemd boolean syntax: `1` / `yes` / `true` / `on`
 mean true, and `0` / `no` / `false` / `off` mean false.
 
 ### `env:Unit.*` (general)
 
-| Field                  | Type   | Required | Default | Description                         |
-| ---------------------- | ------ | -------- | ------- | ----------------------------------- |
-| `env:Unit`             | string | yes      | -       | Unit name; must end with `.service` |
-| `env:Unit.Description` | string | no       | empty   | Description                         |
+| Field                            | Type       | Required | Default | Description                                                                                                       |
+| -------------------------------- | ---------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| `env:Unit`                       | string     | yes      | -       | Unit name; must end with `.service` in this version (`.timer` / `.target` are recognized but not implemented yet) |
+| `env:Unit.Description`           | string     | no       | empty   | Description                                                                                                       |
+| `env:Unit.StartLimitIntervalSec` | nonneg int | no       | `10`    | Start rate-limit interval (seconds); parsed only, no effect yet                                                   |
+| `env:Unit.StartLimitBurst`       | nonneg int | no       | `5`     | Start rate-limit burst; parsed only, no effect yet                                                                |
 
 ### `env:Service.*`
 
@@ -97,5 +103,8 @@ See `example/pm_sysd_w.conf.toml`.
 - Only the `service` unit type; timers and other types are not supported.
 - Dependencies between units are not supported.
 - Custom targets are not supported.
-- Fields not listed are not implemented in the initial version (they may be
-  ignored or kept).
+- Fields not listed are not implemented in the initial version: unlisted fields
+  starting with `Unit.` / `Service.` / `Install.` / `Timer.` / `Win.` produce a
+  `log::warn!()` warning and are written to the log (viewable with pm-sysd-log),
+  then ignored, both when init loads the config at startup and on daemon-reload;
+  all other fields are silently ignored.

@@ -15,19 +15,27 @@ the main config's directory).
 
 The database must store a schema version number (the `schema_version` key in the
 `pm_sysd_w_meta` table, an integer) for version detection and automatic
-upgrades. Rules:
+upgrades. Opening flow:
 
-- New database: write the current schema version (`db::SCHEMA_VERSION`), plus
-  program name / version / timestamp metadata.
-- Older database: run the corresponding migration steps in order, upgrading step
-  by step to the current version.
-- Newer database (created by a newer program version): report an error and exit;
-  no downgrade.
-- After migration, update `schema_version` and related metadata.
+1. First try to read the schema version and the `program` identifier; do not
+   write to the database before the version is confirmed.
+2. Only when the `pm_sysd_w_meta` table does not exist, create the database
+   schema (i.e. a new database).
+3. Only when the current version is older than the version supported by this
+   program (an upgrade is needed), run migrations; migrations are wrapped in a
+   single transaction and complete atomically (either fully succeed or fully
+   fail, never "half upgraded").
+4. Opening a newer database (created by a newer program): report an error and
+   exit; no downgrade.
+5. After migration, update `schema_version` and related metadata.
 
-Currently `SCHEMA_VERSION = 1` with no migration steps. Each future schema
-change must: bump the version number and add the corresponding migration code
-(in the `db` module).
+For a new database, write the current schema version (`db::SCHEMA_VERSION`),
+plus program name / version / timestamp metadata.
+
+Currently `SCHEMA_VERSION = 1`, with no migration steps. Before the v0.1.0
+release (covering all `0.1.0-*` pre-releases), the schema version is not bumped.
+Each future schema change must bump the version number and add the corresponding
+migration code (in the `db` module).
 
 ## Tables (v1)
 
@@ -77,7 +85,18 @@ Log records (written by the `logd` module).
 | `unit`  | TEXT    |                           | Related unit name (may be null)                                                                           |
 | `msg`   | TEXT    | NOT NULL                  | Log message                                                                                               |
 
+### Indexes
+
+| Index          | Table | Column | Description                                |
+| -------------- | ----- | ------ | ------------------------------------------ |
+| `idx_log_unit` | `log` | `unit` | Filter logs by unit (queries)              |
+| `idx_log_ts`   | `log` | `ts`   | Automatic log cleanup / time-based queries |
+
 ## Access
 
 All database access goes through the `db` module wrapper; other modules do not
-touch SQLite directly. See `src/db/`.
+touch SQLite directly. The `db` module starts 2 dedicated (synchronous) threads:
+a database read/write thread and a log writer thread; only those two threads
+touch SQLite directly. Tokio async threads send requests to the database
+read/write thread over MPSC; each request carries a response MPSC, and the
+read/write thread sends the result back after finishing. See `src/db/`.

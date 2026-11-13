@@ -1,6 +1,6 @@
 //! cli::init 模块测试.
 
-use super::*;
+use super::{Instance, parse_args};
 
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -48,4 +48,10 @@ fn parse_args_empty_machine() {
 #[test]
 fn parse_args_empty_conf() {
     assert!(parse_args(&s(&["--system", "--conf="])).is_err());
+}
+
+#[test]
+fn parse_args_instance_conflict() {
+    assert!(parse_args(&s(&["--system", "--user", "--conf=/x/c.toml"])).is_err());
+    assert!(parse_args(&s(&["--system", "--machine=dev", "--conf=/x/c.toml"])).is_err());
 }

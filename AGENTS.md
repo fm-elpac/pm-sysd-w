@@ -12,24 +12,38 @@ pm-sysd-w (胖喵稳哒): Systemd style on Windows.
 ```sh
 cargo fmt
 deno fmt
+
 cargo build
-cargo test
+
+cargo test --all-features
+
 cargo doc
-cargo build --release
+
+cargo build --release --features cli_init
+cargo build --release --features cli_ctl
+cargo build --release --features cli_log
 ```
 
 ## 代码约定
 
 - 源码注释 与 文档注释 一律使用中文 (可以含空格). 标识符与配置关键字使用英文.
-- 禁止 `unsafe` 代码 (`#![deny(unsafe_code)]`).
+- 禁止 `unsafe` 代码 (`#![deny(unsafe_code)]`). 例外: `p_w::console` 与
+  `p_w::acl` 两个模块 (Windows API 无安全替代, 必须调用 `unsafe fn`), 它们以
+  `#[allow(unsafe_code)]` 覆盖 crate 级 deny, 并把 unsafe 调用集中封装.
 - 模块分工: `cli` (命令行程序 公共模块), `cli::init` (pm-sysd-init 程序),
   `cli::ctl` (pm-sysd-ctl 程序), `cli::log` (pm-sysd-log 程序), `jsonl`
   (init/ctl 通信协议), `conf` (调用 pm-tc 读取配置文件), `db` (sqlite 数据库
   抽象/封装), `sysd` (服务管理核心), `logd` (日志 核心), `pa` (平台抽象接口),
   `p_w` (Windows 实现), `p_u` (Linux 实现, 仅测试).
 - 编译产物: 3 个二进制程序 `pm-sysd-init`, `pm-sysd-ctl`, `pm-sysd-log`.
-- 错误处理: 每个模块定义自己的错误枚举, 顶层错误类型用 `From` 汇总; 错误显示仅为
-  尽力而为.
+- 错误处理: 每个模块定义自己的错误枚举, 顶层错误类型用 `From` 汇总;
+  错误显示仅为尽力而为.
+
+- **禁止静默吞掉错误**: 一般不得用 `let _ =` 或 `.ok()` 丢弃 `Result` / 错误;
+  出错时使用 `unwrap` / `expect`, 或 `?` 向上传播. 例外: `Drop` 实现与允许
+  `unsafe` 的模块 (`p_w::console` / `p_w::acl`) 可静默忽略错误.
+  所有忽略错误或疑似静默吞错 (`let _ =`) 之处, 必须加注释说明原因.
+
 - 源码中的 `TODO` 表示未完成, 属正常.
 
 ## 文档约定

@@ -1,7 +1,8 @@
 //! db 模块测试.
 
-use super::*;
-use crate::testutil::TempDir;
+use crate::test::TempDir;
+
+use super::{Db, PROGRAM_NAME};
 
 fn tmp_db(dir: &TempDir, name: &str) -> String {
     dir.path().join(name).to_string_lossy().into_owned()
@@ -151,4 +152,44 @@ fn open_older_schema_upgrades() {
 
     let db = Db::open(&path).unwrap();
     assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("1"));
+}
+
+#[test]
+fn fresh_db_has_indexes() {
+    let dir = TempDir::new("db");
+    let path = tmp_db(&dir, "a.db");
+
+    let db = Db::open(&path).unwrap();
+    let conn = db.conn.lock().unwrap();
+    assert_eq!(index_exists(&conn, "idx_log_unit"), 1);
+    assert_eq!(index_exists(&conn, "idx_log_ts"), 1);
+}
+
+#[test]
+fn log_delete_before() {
+    let dir = TempDir::new("db");
+    let path = tmp_db(&dir, "a.db");
+
+    let db = Db::open(&path).unwrap();
+    db.log_append("2026-11-10T00:00:00.000Z", "info", None, "old")
+        .unwrap();
+    db.log_append("2026-11-11T00:00:00.000Z", "info", None, "new")
+        .unwrap();
+
+    let n = db.log_delete_before("2026-11-11T00:00:00.000Z").unwrap();
+    assert_eq!(n, 1);
+
+    let all = db.log_recent(None, 10).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].msg, "new");
+}
+
+/// 检查索引是否存在 (0/1).
+fn index_exists(conn: &rusqlite::Connection, name: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        rusqlite::params![name],
+        |row| row.get(0),
+    )
+    .unwrap()
 }

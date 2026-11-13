@@ -11,6 +11,10 @@ pub enum DbError {
     Version(String),
     /// 数据库 `program` 标识 不是 pm-sysd-w
     Program(String),
+    /// 数据库内容 异常 (例如 meta 表存在但缺少必要键)
+    Corrupt(String),
+    /// 请求缓冲区 已满 (发送方 无阻塞投递失败)
+    Busy(String),
     /// 通用错误 (携带消息)
     Msg(String),
 }
@@ -23,6 +27,8 @@ impl fmt::Display for DbError {
             Self::Sqlite(m) => write!(f, "db: {}", m),
             Self::Version(m) => write!(f, "db: {}", m),
             Self::Program(m) => write!(f, "db: {}", m),
+            Self::Corrupt(m) => write!(f, "db: {}", m),
+            Self::Busy(m) => write!(f, "db: {}", m),
             Self::Msg(m) => write!(f, "{}", m),
         }
     }
