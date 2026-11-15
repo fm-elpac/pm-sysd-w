@@ -159,18 +159,19 @@ ctl / log 连上 init 后, 首先进行版本号握手 (客户端发送, init �
 
 ### 防御性限制
 
-pm-sysd-init 对 IPC 连接做如下防御 (常量定义在 `jsonl` / `sysd::init` 模块中,
+pm-sysd-init 对 IPC 连接做如下防御 (常量定义在 `pa` / `sysd::init` 模块中,
 方便后续修改):
 
-- 单条消息 最大 1MB (`jsonl::MAX_MESSAGE_LEN`); 超出 报错 (`log::error!()`)
+- 单条消息最大 1MB (`pa::MAX_MESSAGE_LEN`); 超出报错 (`log::error!()`)
   并关闭连接.
-- 单条消息 收 / 发 各自必须在 1 秒内完成 (`jsonl::RECV_TIMEOUT` /
-  `jsonl::SEND_TIMEOUT`); 超时 报错并关闭连接.
+- 单条消息发送必须在 1 秒内完成 (`pa::SEND_TIMEOUT`); 超时报错并关闭连接.
+- 单条消息接收超时 (`pa::RECV_TIMEOUT`) 从收到本条消息第一个字节开始,
+  到本条消息最后一个字节结束; 对方完全没发消息时不超时. 超时报错并关闭连接.
 - pm-sysd-init 最大并发连接 200 (`sysd::init::MAX_CONNECTIONS`);
   超出报错并关闭连接.
-- 单条消息 解析失败 (协议级对不上的错误数据): 报错并关闭连接.
-- 握手消息 无法解析: 报错并关闭连接; 版本不一致: init 发送自己的版本后关闭 连接.
-- 数据读写 使用缓冲块 (`fill_buf` / `consume`, `write_all`), 不逐字节读写.
+- 单条消息解析失败 (协议级对不上的错误数据): 报错并关闭连接.
+- 握手消息无法解析: 报错并关闭连接; 版本不一致: init 发送自己的版本后关闭连接.
+- 数据读写使用缓冲块 (`fill_buf` / `consume`, `write_all`), 不逐字节读写.
 
 传输协议属于内部 API, 不作为外部稳定 API 提供; 小版本更新也可能引入 BREAKING
 change. 原则上 init 与 ctl / log 的版本应一致.
@@ -225,9 +226,13 @@ SYSD_DB = "path/to/XXX.db"
 
 `SYSD_DB` 为绝对路径; 若为相对路径, 则相对于主配置文件所在目录.
 
-pm-sysd-init 只在 启动时 读取 `SYSD_DB` 并 打开数据库; 之后 即使 重新加载
-配置文件 (`daemon-reload`), 也不会 更换数据库文件 (路径), 仍使用 当初打开的
-数据库.
+pm-sysd-init 只在启动时读取 `SYSD_DB` 并打开数据库; 之后即使重新加载 配置文件
+(`daemon-reload`), 也不会更换数据库文件 (路径), 仍使用当初打开的 数据库.
+
+`daemon-reload` 重新读取配置文件后, 还会从数据库重新读取 enable/mask 状态
+(不继承内存中的旧状态); 读取在独立 async task 中完成, 不阻塞 UnitD 主循环.
+reload 期间禁止 enable/disable/reenable/mask/unmask 操作, 也禁止并发
+daemon-reload, 相应请求返回错误.
 
 日志数据 (`logd` 模块) 也存入此 sqlite 数据库. 数据库 schema 详见
 [db.md](db.md).
@@ -261,25 +266,28 @@ async task, 持有私有状态, 单线程 处理自己的状态; 组件之间通
 消息与状态机命名约定 (M 结尾 = 消息, SM 结尾 = 状态机):
 
 - `SysD` (`sysd::sys_d`): 顶层实体, 只负责命令路由. 自己只处理 `SdReq::SysD`
-  (退出 / soft-reboot); `SdReq::LogRO` (日志查询) 转发给 Logd, 其余 ctl 请求与
-  `StartDefaultTarget` 原样转发给 UnitD. 转发消息不阻塞主循环: 每条消息自带
-  oneshot 回执, 转发时直接透传, 只有处理 `SdReq::SysD` 时等待. 退出时先通知
-  UnitD 停止所有 unit, 再通过 `exit_tx` 通知 `sysd::init`, 然后退出自己的循环.
+  (exit / soft-reboot / sqlite-vacuum); `SdReq::LogRO` (日志查询) 转发给 Logd,
+  其余 ctl 请求与 `StartDefaultTarget` 原样转发给 UnitD. 转发消息不阻塞主循环:
+  每条消息自带 oneshot 回执, 转发时直接透传; `sqlite-vacuum` 由独立 task 投递给
+  数据库读写线程, 同样不阻塞主循环. 只有处理 `SdReq::SysD` 中的 exit /
+  soft-reboot 时等待. 退出时先通知 UnitD 停止所有 unit, 再通过 `exit_tx` 通知
+  `sysd::init`, 然后退出自己的循环.
 - `UnitD` (`sysd::unit_d`): 管理所有 unit (内存配置) 并启动 ServiceD; 处理
   daemon-reload, ctl 请求, 以及 service 生命周期编排. 状态机 `UnitDSM`
   (`sysd::unit_d::actor`) 持有内存数据库 `UnitS` (`sysd::unit_d::unit_s`),
   负责决策并输出动作; 配置读取 / 持久化在 `load` (`sysd::unit_d::load`),
   查询合成 task 在 `query` (`sysd::unit_d::query`).
-- `ServiceD` (`sysd::service_d`): 管理所有 service; 状态封装在 `ServiceDSM`
-  (`sysd::service_d::actor`) 中, 查询逻辑在 `query` (`sysd::service_d::query`).
-  ServiceS 的创建 (新启动) 交给 ServiceD 的 job 队列 task 串行执行, 主循环只
-  入队 start job.
+- `ServiceD` (`sysd::service_d`): 管理所有 service; 状态封装在 `Sm`
+  (`sysd::service_d::sm`) 中, actor (`sysd::service_d::actor`)
+  只执行状态机输出的 IO 请求, 查询逻辑在 `query` (`sysd::service_d::query`).
+  ServiceS 的创建 (新启动) 交给 ServiceD 的 job 队列 task 串行执行, 主循环只入队
+  start job.
 - `ServiceS` (`sysd::service_s`): 管理单个 service; 状态封装在 `ServiceSSM`
   (`sysd::service_s::actor`) 中. ServiceS 只持有 SM 与其它组件的引用,
   不直接持有状态. 对外 API 为 `spawn()` / `send()`, 消息 `ServiceSM` 自带
   oneshot 回执.
 - `Logd` (`logd`): 日志记录器. 日志查询请求 (`SdReq::LogRO`) 由 后台 task 处理
-  并回复; 写入 / 测试用查询 (`write_with` / `recent_entries` / `page_entries`)
+  并回复; 写入 / 测试用查询 (`write_with` / `page_entries`)
   直接使用数据库客户端.
 - `TimerD` / `TimerS` (`sysd::timer_d` / `timer_s`): 预留.
 
@@ -301,32 +309,35 @@ service 管理为事件驱动: 子进程退出由监视任务 `await` 子进程�
 整个生命周期保持不变, 因此 daemon-reload 后运行中的 service 仍使用旧配置, 不需要
 unit gc 机制.
 
-### 优雅退出 与 soft-reboot
+### 优雅退出与 soft-reboot
 
 - 退出 / soft-reboot 由 SysD 决定: 收到 `SdReq::SysD` (或外部信号转换成的 exit
   命令) 后, 先让 UnitD 停止所有 service, 再通过 `exit_tx` 通知 init. 外部信号
   (SIGTERM / Ctrl+C) 也统一转换为发给 SysD 的 exit 命令.
-- 退出后 init 记录日志并等待日志落库.
+- 退出后 init 记录日志, 等待日志落库, 然后 (soft-reboot 重启自身前) 对数据库
+  执行一次 vacuum.
 - `soft-reboot` 在完成全部清理工作后, 使用相同命令行参数重启自身: Linux 上
   `exec` 执行自己; Windows 上此时已放弃独占命名管道, 启动新的 `pm-sysd-init.exe`
   后自行退出.
 
-### 日志 防御规则
+### 日志防御规则
 
-- 单条日志 最大 500KB (`db::MAX_LOG_LEN`); 发送方 自动把超长日志拆分为多条.
-- 发送方 投递失败 (接收队列已满) 时 丢弃并 `log::warn!()` 警告; 警告做速率 限制.
-- `db` 模块的日志写入线程 遇到超长日志 丢弃并警告 (防御性检查).
-- 读取 subprocess 的 stdout / stderr: 单行长度受日志最大长度限制, 超长拆分为
-  多条日志. stdout / stderr 不保证 UTF-8; 解码失败时 换成一条 error 日志,
-  写入对应 unit.
-- `pm-sysd-log` 的日志读取接口为 "分页" 接口, 返回 总量 / 游标, 方便灵活读取,
-  同时适配 jsonl 1MB 单条消息限制.
+- 单条日志最大 500KB (`logd::MAX_LOG_LEN`); 发送方自动把超长日志拆分为多条.
+- 发送方投递失败 (接收队列已满) 时丢弃并 `log::warn!()` 警告; 警告做速率限制.
+- `db` 模块的日志写入线程遇到超长日志丢弃并警告 (防御性检查).
+- 读取 subprocess 的 stdout / stderr: 读取缓冲上限为单条日志最大长度, 超长行
+  拆分为多条日志; 不会因单行过长无限增长缓冲. stdout / stderr 不保证 UTF-8;
+  解码失败时换成一条 error 日志, 写入对应 unit.
+- `pm-sysd-log` 的日志读取接口为 "分页" 接口, 返回总量 / 游标; `logd`
+  先用估算选择本页日志, 再用 encode 实测兜底, 保证单页不超过 jsonl 1MB 限制;
+  数据库读取侧也会按累计日志内容长度提前停止, 避免一次读入过大. `pm-sysd-log`
+  通过游标多次读取直至凑够所需条数.
 - 日志保留: 每 1 小时自动清理一次, 只保留最近 72 小时 (`logd` 模块常量).
 
 ### 命名管道权限测试 (手动)
 
-`test/test-permission.ps1` 用于在 Windows 上 手动验证 命名管道 ACL 权限.
-需管理员 运行, 且需先编译二进制:
+`test/test-permission.ps1` 用于在 Windows 上手动验证命名管道 ACL 权限.
+需管理员运行, 且需先编译二进制:
 
 ```sh
 cargo build --features cli_init
@@ -334,10 +345,10 @@ cargo build --features cli_ctl
 powershell -ExecutionPolicy Bypass -File test\test-permission.ps1
 ```
 
-脚本会 启动一个 `--system` 实例, 创建临时标准用户, 分别以 管理员 / 普通用户
-尝试连接 主管道 (`pm_sysd_w_system_default`) 与 只读管道
-(`pm_sysd_w_system_default_ro`), 校验: 普通用户 不能连接 主管道, 但 能连接
-只读管道. 该脚本 必须手动运行 (自动化测试 不覆盖 跨用户权限).
+脚本会启动一个 `--system` 实例, 创建临时标准用户, 分别以管理员 / 普通用户
+尝试连接主管道 (`pm_sysd_w_system_default`) 与只读管道
+(`pm_sysd_w_system_default_ro`), 校验: 普通用户不能连接主管道, 但能连接
+只读管道. 该脚本必须手动运行 (自动化测试不覆盖跨用户权限).
 
 ## pm-sysd-ctl
 
@@ -387,6 +398,8 @@ daemon-reload
 
 soft-reboot  # 重启 pm-sysd-init 自身及所有被管理服务 (不是 Windows 重启)
 exit  # 退出 pm-sysd-init
+
+sqlite-vacuum  # 对 sqlite 数据库执行 vacuum
 ```
 
 这些命令 CLI 都要有, 但初版不一定实际实现功能, 可以只输出 `TODO`; 也不必支持更多
@@ -480,6 +493,10 @@ Windows 上连接 `--system` 时, 优先连接主管道 `pm_sysd_w_system_defaul
   `#[allow(unsafe_code)]` 覆盖 crate 级 deny, 并把 unsafe 调用集中封装.
 - 错误处理: 每个模块定义自己的错误枚举, 顶层错误类型用 `From` 汇总; 错误显示仅为
   尽力而为, 便于开发调试.
+
+- 关于 panic: `unwrap()` / `expect()` 只能用于 "按设计不可能失败" 的场景. 一旦
+  panic, 就是代码 BUG, 需要修复. 配置错误, 外部错误 (IPC 连接, 组件退出等)
+  不应直接 panic; 应使用更优雅的错误处理 (返回错误, 或 `log::error!()` 后丢弃).
 
 - **禁止静默吞掉错误**: 一般不得用 `let _ =` 或 `.ok()` 丢弃 `Result` / 错误;
   出错时使用 `unwrap` / `expect`, 或 `?` 向上传播. 例外: `Drop` 实现与允许

@@ -13,9 +13,6 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// 本程序的数据库标识 (写入 `pm_sysd_w_meta` 表的 `program` 键, 打开时校验).
 pub const PROGRAM_NAME: &str = "pm-sysd-w";
 
-/// 单条日志 最大长度 (字节), 超出 由发送方拆分为多条.
-pub const MAX_LOG_LEN: usize = 500 * 1024;
-
 /// v1 基础表结构 (不含索引).
 pub const SCHEMA_TABLES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pm_sysd_w_meta (
@@ -54,7 +51,8 @@ CREATE TABLE IF NOT EXISTS log (
   unit  TEXT,
   msg   TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_log_unit ON log(unit, level);
+CREATE INDEX IF NOT EXISTS idx_log_unit ON log(unit, id);
+CREATE INDEX IF NOT EXISTS idx_log_level ON log(level, id);
 CREATE INDEX IF NOT EXISTS idx_log_ts ON log(ts);
 "#;
 

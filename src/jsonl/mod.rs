@@ -28,7 +28,8 @@ mod test;
 
 pub use error::JsonlError;
 pub use hello::{
-    Hello, HelloData, PROTOCOL_VERSION, VERSION, check_version, decode_hello, encode_hello,
+    Hello, HelloData, PROTOCOL_VERSION, VERSION, VersionMismatch, check_version, decode_hello,
+    encode_hello,
 };
 pub use req::{
     SdReq, SdReqLogQuery, SdReqLogRO, SdReqSysd, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO,

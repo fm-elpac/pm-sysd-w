@@ -2,7 +2,20 @@
 //!
 //! 相当于 `systemctl` 的角色: 通过与 pm-sysd-init 交互完成操作. 同步执行.
 //!
-//! 显示/格式化输出 由本模块负责; init 只返回 结构化 数据.
+//! 显示/格式化输出由本模块负责; init 只返回结构化数据.
+//!
+//! ## 输出格式与退出码原则
+//!
+//! ctl 的输出格式 (内容/列对齐) 与退出码尽量模仿 `systemctl`, 参考
+//! <https://www.freedesktop.org/software/systemd/man/latest/systemctl.html>.
+//!
+//! - 表格命令 (`list-units`) 使用动态列宽: 每列左对齐, 列宽取该列内容
+//!   最长值, 列间以一个空格分隔; 首行打印大写列名, 整表左侧空两格
+//!   (对应 systemctl 的状态圆点列, 本项目省略圆点/颜色).
+//! - 退出码遵循 LSB 约定: 0 = 成功/active, 1 = 非 enabled / 非 failed,
+//!   3 = 非 active, 4 = 未知 (unit 不存在).
+//! - 与本项目当前功能集无关或无法提供的字段会被省略; 具体省略清单见
+//!   `print` 模块注释.
 
 use std::process::ExitCode;
 
@@ -167,9 +180,9 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         SdReqUnitRO as Ur, SdReqUnitd as Ud, SdReqUnitdRO as Udr,
     };
 
-    if now && !matches!(command, "enable" | "disable") {
+    if now && !matches!(command, "enable" | "disable" | "mask") {
         return Err(CtlError::Msg(
-            "--now is only valid with enable/disable".into(),
+            "--now is only valid with enable/disable/mask".into(),
         ));
     }
 
@@ -306,7 +319,7 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         }),
         "mask" => C::Unit(U {
             name: unit(command)?,
-            op: Op::Mask,
+            op: Op::Mask { now },
         }),
         "unmask" => C::Unit(U {
             name: unit(command)?,
@@ -349,6 +362,10 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         "exit" => {
             no_args(command)?;
             C::SysD(Sy::Exit)
+        }
+        "sqlite-vacuum" => {
+            no_args(command)?;
+            C::SysD(Sy::SqliteVacuum)
         }
         other => return Err(CtlError::Msg(format!("unknown command: {}", other))),
     })

@@ -37,31 +37,31 @@ mean true, and `0` / `no` / `false` / `off` mean false.
 | -------------------------------- | ---------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
 | `env:Unit`                       | string     | yes      | -       | Unit name; must end with `.service` in this version (`.timer` / `.target` are recognized but not implemented yet) |
 | `env:Unit.Description`           | string     | no       | empty   | Description                                                                                                       |
-| `env:Unit.StartLimitIntervalSec` | nonneg int | no       | `10`    | Start rate-limit interval (seconds); parsed only, no effect yet                                                   |
-| `env:Unit.StartLimitBurst`       | nonneg int | no       | `5`     | Start rate-limit burst; parsed only, no effect yet                                                                |
+| `env:Unit.StartLimitIntervalSec` | nonneg int | no       | `10`    | Start rate-limit interval (seconds); `0` disables the limit                                                       |
+| `env:Unit.StartLimitBurst`       | nonneg int | no       | `5`     | Start rate-limit burst; `0` disables the limit; exceeding it rejects starts / stops auto-restarting               |
 
 ### `env:Service.*`
 
-| Field                          | Type       | Required | Default           | Description                                              |
-| ------------------------------ | ---------- | -------- | ----------------- | -------------------------------------------------------- |
-| `env:Service.Type`             | enum       | no       | `simple`          | Start type (values below)                                |
-| `env:Service.ExecStart`        | string     | yes      | -                 | Start command (program path + args)                      |
-| `env:Service.ExecStop`         | string     | no       | -                 | Stop command                                             |
-| `env:Service.ExecReload`       | string     | no       | -                 | Reload command                                           |
-| `env:Service.Restart`          | enum       | no       | `no`              | Restart policy (values below)                            |
-| `env:Service.RestartSec`       | nonneg int | no       | `1`               | Seconds to wait before restart (only when Restart != no) |
-| `env:Service.TimeoutStartSec`  | nonneg int | no       | `90`              | Start timeout (seconds)                                  |
-| `env:Service.TimeoutStopSec`   | nonneg int | no       | `90`              | Stop timeout (seconds)                                   |
-| `env:Service.WorkingDirectory` | string     | no       | inherit from init | Working directory                                        |
-| `env:Service.Environment`      | string     | no       | -                 | Environment variable, `KEY=VALUE`                        |
-| `env:Service.RemainAfterExit`  | bool       | no       | `no`              | Whether to stay active after the process exits           |
+| Field                          | Type       | Required | Default           | Description                                                          |
+| ------------------------------ | ---------- | -------- | ----------------- | -------------------------------------------------------------------- |
+| `env:Service.Type`             | enum       | no       | `simple`          | Start type (values below)                                            |
+| `env:Service.ExecStart`        | string     | yes      | -                 | Start command (program path + args)                                  |
+| `env:Service.ExecStop`         | string     | no       | -                 | Stop command                                                         |
+| `env:Service.ExecReload`       | string     | no       | -                 | Reload command                                                       |
+| `env:Service.Restart`          | enum       | no       | `no`              | Restart policy (values below)                                        |
+| `env:Service.RestartSec`       | nonneg int | no       | `1`               | Seconds to wait before restart (only when Restart != no)             |
+| `env:Service.TimeoutStartSec`  | nonneg int | no       | `90`              | Start timeout (seconds); only for `Type=oneshot`, `0` disables it    |
+| `env:Service.TimeoutStopSec`   | nonneg int | no       | `90`              | Stop timeout (seconds); bounds `ExecStop` execution, `0` disables it |
+| `env:Service.WorkingDirectory` | string     | no       | inherit from init | Working directory                                                    |
+| `env:Service.Environment`      | string     | no       | -                 | Environment variable, `KEY=VALUE`                                    |
+| `env:Service.RemainAfterExit`  | bool       | no       | `no`              | Whether to stay active after the process exits                       |
 
 `Type` values (initial version):
 
-| Value     | Description                                                                     |
-| --------- | ------------------------------------------------------------------------------- |
-| `simple`  | Default; considered active as soon as it is started                             |
-| `oneshot` | Considered started when the process exits (successfully); does not keep running |
+| Value     | Description                                                                                                            |
+| --------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `simple`  | Default; considered active as soon as it is started                                                                    |
+| `oneshot` | Considered started when the process exits (successfully); does not keep running; `start` waits for ExecStart to finish |
 
 `Restart` values (initial simple implementation):
 

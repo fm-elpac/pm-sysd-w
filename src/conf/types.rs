@@ -142,8 +142,6 @@ pub struct Conf {
     pub units: Vec<Unit>,
     /// sqlite 数据库路径 (绝对路径)
     pub db_path: String,
-    /// 主配置文件所在目录 (绝对路径)
-    pub conf_dir: String,
     /// 加载时 产生的 警告 (不支持的 `Unit.` / `Service.` / `Install.` / `Timer.` /
     /// `Win.` 前缀 key). 由调用方 通过 `log::warn!()` 输出并写入日志.
     pub warnings: Vec<String>,

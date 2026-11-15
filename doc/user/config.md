@@ -35,31 +35,31 @@ bool 字段支持 systemd 布尔语法: `1` / `yes` / `true` / `on` 表示 正�
 | -------------------------------- | -------- | ---- | ---- | ------------------------------------------------------------------------------- |
 | `env:Unit`                       | 字符串   | 是   | -    | unit 名称, 当前版本须以 `.service` 结尾 (`.timer` / `.target` 已识别但尚未实现) |
 | `env:Unit.Description`           | 字符串   | 否   | 空   | 描述                                                                            |
-| `env:Unit.StartLimitIntervalSec` | 非负整数 | 否   | `10` | 启动限流时间窗口 (秒), 当前仅解析, 暂不生效                                     |
-| `env:Unit.StartLimitBurst`       | 非负整数 | 否   | `5`  | 启动限流次数, 当前仅解析, 暂不生效                                              |
+| `env:Unit.StartLimitIntervalSec` | 非负整数 | 否   | `10` | 启动限流时间窗口 (秒), `0` 表示不限流                                           |
+| `env:Unit.StartLimitBurst`       | 非负整数 | 否   | `5`  | 启动限流次数, `0` 表示不限流; 窗口内超过该次数后拒绝启动 / 停止自动重启         |
 
 ### `env:Service.*`
 
-| 字段                           | 类型     | 必填 | 默认      | 说明                                         |
-| ------------------------------ | -------- | ---- | --------- | -------------------------------------------- |
-| `env:Service.Type`             | 枚举     | 否   | `simple`  | 启动类型, 取值见下                           |
-| `env:Service.ExecStart`        | 字符串   | 是   | -         | 启动命令 (程序路径 + 参数)                   |
-| `env:Service.ExecStop`         | 字符串   | 否   | -         | 停止命令                                     |
-| `env:Service.ExecReload`       | 字符串   | 否   | -         | reload 命令                                  |
-| `env:Service.Restart`          | 枚举     | 否   | `no`      | 重启策略, 取值见下                           |
-| `env:Service.RestartSec`       | 非负整数 | 否   | `1`       | 重启前等待时间 (秒), 仅 Restart != no 时有效 |
-| `env:Service.TimeoutStartSec`  | 非负整数 | 否   | `90`      | 启动超时 (秒)                                |
-| `env:Service.TimeoutStopSec`   | 非负整数 | 否   | `90`      | 停止超时 (秒)                                |
-| `env:Service.WorkingDirectory` | 字符串   | 否   | 继承 init | 工作目录                                     |
-| `env:Service.Environment`      | 字符串   | 否   | -         | 环境变量, `KEY=VALUE`                        |
-| `env:Service.RemainAfterExit`  | bool     | 否   | `no`      | 进程退出后是否仍视为 active                  |
+| 字段                           | 类型     | 必填 | 默认      | 说明                                                    |
+| ------------------------------ | -------- | ---- | --------- | ------------------------------------------------------- |
+| `env:Service.Type`             | 枚举     | 否   | `simple`  | 启动类型, 取值见下                                      |
+| `env:Service.ExecStart`        | 字符串   | 是   | -         | 启动命令 (程序路径 + 参数)                              |
+| `env:Service.ExecStop`         | 字符串   | 否   | -         | 停止命令                                                |
+| `env:Service.ExecReload`       | 字符串   | 否   | -         | reload 命令                                             |
+| `env:Service.Restart`          | 枚举     | 否   | `no`      | 重启策略, 取值见下                                      |
+| `env:Service.RestartSec`       | 非负整数 | 否   | `1`       | 重启前等待时间 (秒), 仅 Restart != no 时有效            |
+| `env:Service.TimeoutStartSec`  | 非负整数 | 否   | `90`      | 启动超时 (秒), 仅 `Type=oneshot` 有效, `0` 表示不超时   |
+| `env:Service.TimeoutStopSec`   | 非负整数 | 否   | `90`      | 停止超时 (秒), 约束 `ExecStop` 执行时间, `0` 表示不超时 |
+| `env:Service.WorkingDirectory` | 字符串   | 否   | 继承 init | 工作目录                                                |
+| `env:Service.Environment`      | 字符串   | 否   | -         | 环境变量, `KEY=VALUE`                                   |
+| `env:Service.RemainAfterExit`  | bool     | 否   | `no`      | 进程退出后是否仍视为 active                             |
 
 `Type` 取值 (初版):
 
-| 值        | 说明                                     |
-| --------- | ---------------------------------------- |
-| `simple`  | 默认, 启动即视为 active                  |
-| `oneshot` | 进程退出 (成功) 视为启动完成, 不持续运行 |
+| 值        | 说明                                                                          |
+| --------- | ----------------------------------------------------------------------------- |
+| `simple`  | 默认, 启动即视为 active                                                       |
+| `oneshot` | 进程退出 (成功) 视为启动完成, 不持续运行; `start` 命令等待 ExecStart 执行完成 |
 
 `Restart` 取值 (初版简单实现):
 

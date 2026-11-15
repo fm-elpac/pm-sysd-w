@@ -162,13 +162,16 @@ one.
 ### Defensive Limits
 
 pm-sysd-init applies the following defenses to IPC connections (constants are
-defined in the `jsonl` / `sysd::init` modules for easy adjustment):
+defined in the `pa` / `sysd::init` modules for easy adjustment):
 
-- A single message is at most 1 MB (`jsonl::MAX_MESSAGE_LEN`); exceeding it
-  reports an error (`log::error!()`) and closes the connection.
-- A single message send / receive must complete within 1 second
-  (`jsonl::RECV_TIMEOUT` / `jsonl::SEND_TIMEOUT`); a timeout reports an error
-  and closes the connection.
+- A single message is at most 1 MB (`pa::MAX_MESSAGE_LEN`); exceeding it reports
+  an error (`log::error!()`) and closes the connection.
+- A single message send must complete within 1 second (`pa::SEND_TIMEOUT`); a
+  timeout reports an error and closes the connection.
+- The receive timeout (`pa::RECV_TIMEOUT`) starts when the first byte of a
+  message arrives and ends when the last byte of that message arrives; if the
+  peer sends nothing at all, there is no timeout. A timeout reports an error and
+  closes the connection.
 - pm-sysd-init allows at most 200 concurrent connections
   (`sysd::init::MAX_CONNECTIONS`); exceeding it reports an error and closes the
   connection.
@@ -246,6 +249,12 @@ pm-sysd-init reads `SYSD_DB` and opens the database only once at startup. A
 later `daemon-reload` does not switch to a different database file (path); it
 keeps using the database opened at startup.
 
+After re-reading the config file, `daemon-reload` also re-reads enable/mask
+state from the database (it does not inherit the previous in-memory state); the
+read happens in a dedicated async task and does not block the UnitD main loop.
+While a reload is in progress, enable/disable/reenable/mask/unmask operations
+and concurrent `daemon-reload` requests are rejected with an error.
+
 Log data (the `logd` module) is also stored in this SQLite database. See
 [db.md](db.md) for the schema.
 
@@ -286,24 +295,26 @@ Naming convention for messages and state machines (M suffix = message, SM suffix
 = state machine):
 
 - `SysD` (`sysd::sys_d`): the top-level entity, responsible only for command
-  routing. It handles `SdReq::SysD` (exit / soft-reboot) itself; `SdReq::LogRO`
-  (log queries) is forwarded to Logd, and all other ctl requests and
-  `StartDefaultTarget` are forwarded to UnitD as-is. Forwarded messages do not
-  block the main loop: each message carries its own oneshot reply and is
-  forwarded directly, so the loop only waits when handling `SdReq::SysD`. On
-  exit it first tells UnitD to stop all units, then notifies `sysd::init` via
-  `exit_tx`, then exits its own loop.
+  routing. It handles `SdReq::SysD` (exit / soft-reboot / sqlite-vacuum) itself;
+  `SdReq::LogRO` (log queries) is forwarded to Logd, and all other ctl requests
+  and `StartDefaultTarget` are forwarded to UnitD as-is. Forwarded messages do
+  not block the main loop: each message carries its own oneshot reply and is
+  forwarded directly; `sqlite-vacuum` is sent to the database read-write thread
+  by a dedicated task, so it also does not block the main loop. The loop only
+  waits when handling exit / soft-reboot. On exit it first tells UnitD to stop
+  all units, then notifies `sysd::init` via `exit_tx`, then exits its own loop.
 - `UnitD` (`sysd::unit_d`): manages all units (in-memory config), starts
   ServiceD, and handles `daemon-reload`, ctl requests, and service lifecycle
   orchestration. The `UnitDSM` state machine (`sysd::unit_d::actor`) holds the
   in-memory database `UnitS` (`sysd::unit_d::unit_s`) and outputs actions;
   config loading / persistence lives in `load` (`sysd::unit_d::load`), and query
   combining tasks live in `query` (`sysd::unit_d::query`).
-- `ServiceD` (`sysd::service_d`): manages all services; state lives in
-  `ServiceDSM` (`sysd::service_d::actor`) and query logic lives in `query`
-  (`sysd::service_d::query`). ServiceS creation (new start) is delegated to a
-  dedicated job-queue task that creates instances serially; the main loop only
-  enqueues start jobs.
+- `ServiceD` (`sysd::service_d`): manages all services; state lives in `Sm`
+  (`sysd::service_d::sm`), the actor (`sysd::service_d::actor`) only executes
+  the IO requests produced by the state machine, and query logic lives in
+  `query` (`sysd::service_d::query`). ServiceS creation (new start) is delegated
+  to a dedicated job-queue task that creates instances serially; the main loop
+  only enqueues start jobs.
 - `ServiceS` (`sysd::service_s`): manages a single service; state lives in
   `ServiceSSM` (`sysd::service_s::actor`). ServiceS only holds the SM plus
   references to other components, not state directly. Its public API is
@@ -311,8 +322,7 @@ Naming convention for messages and state machines (M suffix = message, SM suffix
   reply.
 - `Logd` (`logd`): the log recorder. Log query requests (`SdReq::LogRO`) are
   handled and replied to by a background task; write / test queries
-  (`write_with` / `recent_entries` / `page_entries`) use the database client
-  directly.
+  (`write_with` / `page_entries`) use the database client directly.
 - `TimerD` / `TimerS` (`sysd::timer_d` / `timer_s`): reserved.
 
 The messages that may be sent between components (such as `SysDM` / `UnitDM` /
@@ -344,7 +354,8 @@ service keeps using the old config — no unit GC mechanism is needed.
   exit command converted from an external signal), it first has UnitD stop all
   services, then notifies init via `exit_tx`. External signals (SIGTERM /
   Ctrl+C) are also converted into an exit command sent to SysD.
-- After exit, init records the log and waits for logs to be flushed.
+- After exit, init records the log, waits for logs to be flushed, and then
+  (before soft-reboot restarts itself) runs a vacuum on the database.
 - `soft-reboot`, after all cleanup is done, restarts itself with the same
   command-line arguments: on Linux it `exec`s itself; on Windows it has already
   released the exclusive named pipe, so it starts a new `pm-sysd-init.exe` and
@@ -352,19 +363,23 @@ service keeps using the old config — no unit GC mechanism is needed.
 
 ### Log Defensive Rules
 
-- A single log is at most 500 KB (`db::MAX_LOG_LEN`); the sender automatically
+- A single log is at most 500 KB (`logd::MAX_LOG_LEN`); the sender automatically
   splits over-long logs into multiple entries.
 - When the sender's delivery fails (receive queue full), drop the log and emit a
   rate-limited `log::warn!()`.
 - The `db` module's log writer thread also drops and warns on over-long logs
   (defensive check).
-- Reading a subprocess's stdout / stderr: a single line is limited by the max
-  log length, and over-long lines are split into multiple log entries. stdout /
-  stderr is not guaranteed to be UTF-8; on decode failure it is replaced with
-  one error log entry written to the unit.
+- Reading a subprocess's stdout / stderr: the read buffer is capped at the max
+  log length, so over-long lines are split into multiple log entries and the
+  buffer never grows without bound. stdout / stderr is not guaranteed to be
+  UTF-8; on decode failure it is replaced with one error log entry written to
+  the unit.
 - `pm-sysd-log`'s log-reading interface is a "pagination" interface returning
-  total count / cursor, for flexible reading and to fit the jsonl 1 MB
-  single-message limit.
+  total count / cursor; `logd` first selects the page with an estimate, then
+  verifies with an actual encode, keeping each page within the jsonl 1 MB
+  single-message limit. The database read side also stops early based on the
+  cumulative log content length to avoid reading too much at once. `pm-sysd-log`
+  reads repeatedly via the cursor until it has collected the requested number.
 - Log retention: automatic cleanup runs once per hour, keeping only the last 72
   hours (constants in the `logd` module).
 
@@ -435,6 +450,7 @@ daemon-reload
 
 soft-reboot  # restart pm-sysd-init itself and all managed services (not a Windows reboot)
 exit  # exit pm-sysd-init
+sqlite-vacuum  # run a vacuum on the sqlite database
 ```
 
 All these commands must exist in the CLI, but the initial version does not
@@ -537,6 +553,11 @@ User-defined targets are currently not supported.
 - Error handling: each module defines its own error enum; the top-level error
   type aggregates them via `From`. Error display is best-effort, for
   development/debugging.
+- On panic: `unwrap()` / `expect()` may only be used for cases that "cannot fail
+  by design". A panic is a code bug and must be fixed. Config errors and
+  external errors (IPC connections, component exits, etc.) must not panic
+  directly; handle them gracefully (return an error, or `log::error!()` and
+  drop).
 - No silent error swallowing: generally do not discard `Result`/errors with
   `let _ =` or `.ok()`; on error use `unwrap` / `expect`, or propagate with `?`.
   Exceptions: `Drop` impls and the `unsafe`-allowed modules (`p_w::console` /

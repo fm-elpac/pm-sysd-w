@@ -110,7 +110,6 @@ pub fn load_conf(conf_path: &str) -> Result<Conf, ConfError> {
     Ok(Conf {
         units,
         db_path,
-        conf_dir: conf_dir.to_string_lossy().into_owned(),
         warnings,
     })
 }

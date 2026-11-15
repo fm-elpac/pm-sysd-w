@@ -21,11 +21,10 @@ fn open_and_persist() {
     assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("1"));
 
     db.unit_set_enabled("a.service", true).unwrap();
-    assert!(db.unit_get_enabled("a.service").unwrap());
-    assert!(!db.unit_get_enabled("b.service").unwrap());
+    assert_eq!(db.unit_list_enabled().unwrap(), vec!["a.service"]);
 
     db.unit_set_masked("a.service", true).unwrap();
-    assert!(db.unit_get_masked("a.service").unwrap());
+    assert_eq!(db.unit_list_masked().unwrap(), vec!["a.service"]);
 }
 
 #[test]
@@ -39,12 +38,12 @@ fn reopen_keeps_state() {
     }
     {
         let db = Db::open(&path).unwrap();
-        assert!(db.unit_get_enabled("a.service").unwrap());
+        assert_eq!(db.unit_list_enabled().unwrap(), vec!["a.service"]);
     }
 }
 
 #[test]
-fn log_append_recent() {
+fn log_append_filter() {
     let dir = TempDir::new("db");
     let path = tmp_db(&dir, "a.db");
 
@@ -59,18 +58,27 @@ fn log_append_recent() {
     )
     .unwrap();
 
-    let all = db.log_recent(None, 10).unwrap();
-    assert_eq!(all.len(), 2);
-    assert_eq!(all[0].msg, "hello");
-    assert_eq!(all[1].msg, "boom");
+    // 按 id 倒序返回.
+    let all = db.log_page_raw(None, None, 10, None, usize::MAX).unwrap();
+    assert_eq!(all.entries.len(), 2);
+    assert_eq!(all.entries[0].msg, "boom");
+    assert_eq!(all.entries[1].msg, "hello");
 
-    let one = db.log_recent(Some("a.service"), 10).unwrap();
-    assert_eq!(one.len(), 1);
-    assert_eq!(one[0].msg, "boom");
+    let one = db
+        .log_page_raw(None, Some("a.service"), 10, None, usize::MAX)
+        .unwrap();
+    assert_eq!(one.entries.len(), 1);
+    assert_eq!(one.entries[0].msg, "boom");
+
+    let err = db
+        .log_page_raw(Some("error"), None, 10, None, usize::MAX)
+        .unwrap();
+    assert_eq!(err.entries.len(), 1);
+    assert_eq!(err.entries[0].msg, "boom");
 }
 
 #[test]
-fn log_recent_limit_and_order() {
+fn log_page_raw_limit_and_order() {
     let dir = TempDir::new("db");
     let path = tmp_db(&dir, "a.db");
 
@@ -85,10 +93,11 @@ fn log_recent_limit_and_order() {
         .unwrap();
     }
 
-    let recent = db.log_recent(None, 3).unwrap();
-    assert_eq!(recent.len(), 3);
-    assert_eq!(recent[0].msg, "m2");
-    assert_eq!(recent[2].msg, "m4");
+    let page = db.log_page_raw(None, None, 3, None, usize::MAX).unwrap();
+    assert_eq!(page.entries.len(), 3);
+    // 按 id 倒序返回, 只取最新 3 条.
+    assert_eq!(page.entries[0].msg, "m4");
+    assert_eq!(page.entries[2].msg, "m2");
 }
 
 #[test]
@@ -162,6 +171,7 @@ fn fresh_db_has_indexes() {
     let db = Db::open(&path).unwrap();
     let conn = db.conn.lock().unwrap();
     assert_eq!(index_exists(&conn, "idx_log_unit"), 1);
+    assert_eq!(index_exists(&conn, "idx_log_level"), 1);
     assert_eq!(index_exists(&conn, "idx_log_ts"), 1);
 }
 
@@ -179,9 +189,19 @@ fn log_delete_before() {
     let n = db.log_delete_before("2026-11-11T00:00:00.000Z").unwrap();
     assert_eq!(n, 1);
 
-    let all = db.log_recent(None, 10).unwrap();
-    assert_eq!(all.len(), 1);
-    assert_eq!(all[0].msg, "new");
+    let all = db.log_page_raw(None, None, 10, None, usize::MAX).unwrap();
+    assert_eq!(all.entries.len(), 1);
+    assert_eq!(all.entries[0].msg, "new");
+}
+
+#[test]
+fn vacuum_ok() {
+    let dir = TempDir::new("db");
+    let path = tmp_db(&dir, "a.db");
+
+    let db = Db::open(&path).unwrap();
+    db.unit_set_enabled("a.service", true).unwrap();
+    db.vacuum().unwrap();
 }
 
 /// 检查索引是否存在 (0/1).

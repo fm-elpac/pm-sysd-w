@@ -147,32 +147,50 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
 async fn run(unit: Option<String>, instance: Instance) -> Result<(), LogError> {
     let mut stream = connect(&instance).await.map_err(LogError::Msg)?;
 
-    // 发送日志查询命令.
-    let command = SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
-        unit,
-        limit: DEFAULT_LIMIT,
-        cursor: None,
-    }));
-    let line = encode_frame(&command).map_err(|e| LogError::Msg(e.to_string()))?;
-    stream
-        .send(line)
-        .await
-        .map_err(|e| LogError::Msg(e.to_string()))?;
+    // 分页读取: logd 会按 1MB 消息上限主动减少每页条数, 这里循环拉取直到
+    // 凑够 DEFAULT_LIMIT 条或没有更多日志.
+    let mut cursor: Option<i64> = None;
+    let mut all: Vec<SdResLogEntry> = Vec::new();
+    while (all.len() as u32) < DEFAULT_LIMIT {
+        let limit = DEFAULT_LIMIT - all.len() as u32;
+        let command = SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
+            // pm-sysd-log 暂不实现按 level 过滤, 固定不过滤.
+            level: None,
+            unit: unit.clone(),
+            limit,
+            cursor,
+        }));
+        let line = encode_frame(&command).map_err(|e| LogError::Msg(e.to_string()))?;
+        stream
+            .send(line)
+            .await
+            .map_err(|e| LogError::Msg(e.to_string()))?;
 
-    // 接收响应 并 打印.
-    let line = stream
-        .recv()
-        .await
-        .map_err(|e| LogError::Msg(e.to_string()))?;
-    let resp: SdRes = decode_frame(&line).map_err(|e| LogError::Msg(e.to_string()))?;
-    match resp {
-        SdRes::Logs { logs, .. } => {
-            print_logs(&logs);
-            Ok(())
+        let line = stream
+            .recv()
+            .await
+            .map_err(|e| LogError::Msg(e.to_string()))?;
+        let resp: SdRes = decode_frame(&line).map_err(|e| LogError::Msg(e.to_string()))?;
+        match resp {
+            SdRes::Logs {
+                logs, cursor: next, ..
+            } => {
+                let count = logs.len();
+                all.extend(logs);
+                cursor = next;
+                if count == 0 || cursor.is_none() {
+                    break;
+                }
+            }
+            SdRes::Err(message) => return Err(LogError::Msg(message)),
+            _ => return Err(LogError::Msg("unexpected response from init".into())),
         }
-        SdRes::Err(message) => Err(LogError::Msg(message)),
-        _ => Err(LogError::Msg("unexpected response from init".into())),
     }
+
+    // 多页之间按 id 升序输出, 与单页内顺序保持一致.
+    all.sort_by_key(|e| e.id);
+    print_logs(&all);
+    Ok(())
 }
 
 /// 打印日志 (模仿 journalctl 的 short 格式).

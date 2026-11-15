@@ -23,6 +23,13 @@ pub enum SdReq {
     Unit(SdReqUnit),
 }
 
+impl SdReq {
+    /// 是否为只读请求 (允许从只读连接发出).
+    pub fn is_readonly(&self) -> bool {
+        matches!(self, SdReq::LogRO(_) | SdReq::UnitdRO(_) | SdReq::UnitRO(_))
+    }
+}
+
 /// SysD 组件直接处理的请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -31,6 +38,8 @@ pub enum SdReqSysd {
     SoftReboot,
     /// 退出 init
     Exit,
+    /// 对 sqlite 数据库执行 vacuum (由数据库读写线程处理)
+    SqliteVacuum,
 }
 
 /// 日志 只读查询请求
@@ -44,7 +53,11 @@ pub enum SdReqLogRO {
 /// 日志查询条件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdReqLogQuery {
+    /// 按 level 过滤 (省略则不过滤)
+    #[serde(default)]
+    pub level: Option<String>,
     /// 按 unit 过滤 (省略则不过滤)
+    #[serde(default)]
     pub unit: Option<String>,
     /// 每页最多读取条数
     #[serde(default)]
@@ -140,7 +153,11 @@ pub enum SdReqUnitOp {
     /// preset (初版 TODO)
     Preset,
     /// mask
-    Mask,
+    Mask {
+        /// 是否同时 stop 正在运行的 unit
+        #[serde(default)]
+        now: bool,
+    },
     /// unmask
     Unmask,
     /// 启动

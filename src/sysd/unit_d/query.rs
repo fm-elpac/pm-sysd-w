@@ -1,6 +1,6 @@
 //! 查询类命令的 async task (组合 UnitD 快照与 ServiceD 数据).
 //!
-//! 状态机 ([`super::actor::UnitDSM`]) 对查询命令只做只读决策, 输出
+//! 状态机 ([`super::sm::Sm`]) 对查询命令只做只读决策, 输出
 //! [`QueryReq`] 动作; UnitD 在主循环中 `tokio::spawn` 本模块的 task, 向 ServiceD
 //! 查询运行状态, 再结合 UnitD 侧快照合成响应. 响应由 UnitD 发送 (本模块不接触
 //! `oneshot::Sender`).
@@ -13,7 +13,7 @@ use crate::{
     conf::{Unit, UnitType},
     jsonl::{SdRes, SdResServiceStatus, SdResUnitS, SdResUnitState, SdResUnitStatus},
     sysd::{
-        ServiceSta, TargetSta, UnitSta, UnitSubSta,
+        EnableSta, LoadSta, ServiceSta, TargetSta, UnitSta, UnitSubSta, send_reply,
         service_d::{ServiceD, ServiceDM, StatusInfo},
     },
 };
@@ -24,8 +24,8 @@ pub struct UnitInfo {
     pub name: String,
     pub description: String,
     pub unit_type: UnitType,
-    pub enabled: bool,
-    pub masked: bool,
+    pub load: LoadSta,
+    pub enable: EnableSta,
 }
 
 /// 查询请求 (由状态机输出)
@@ -61,7 +61,7 @@ pub fn spawn_query(req: QueryReq, sd: ServiceD, tx: oneshot::Sender<SdRes>) {
             QueryKind::UnitState { name, info } => unit_state(&name, info, &sd).await,
             QueryKind::Status { name, info } => status(&name, info, &sd).await,
         };
-        tx.send(r).expect("unitd reply channel closed");
+        send_reply(tx, r);
     });
 }
 
@@ -137,8 +137,8 @@ async fn list_units(target: &str, infos: Vec<UnitInfo>, sd: &ServiceD) -> SdRes 
                 unit_type: info.unit_type,
                 active,
                 sub: UnitSubSta::Service(sub),
-                enabled: info.enabled,
-                masked: info.masked,
+                load: info.load,
+                enable: info.enable,
             }
         })
         .collect();
@@ -150,8 +150,8 @@ async fn list_units(target: &str, infos: Vec<UnitInfo>, sd: &ServiceD) -> SdRes 
         unit_type: UnitType::Target,
         active: UnitSta::Active,
         sub: UnitSubSta::Target(TargetSta::Active),
-        enabled: false,
-        masked: false,
+        load: LoadSta::Loaded,
+        enable: EnableSta::Static,
     });
 
     SdRes::ListUnits(out)
@@ -159,12 +159,52 @@ async fn list_units(target: &str, infos: Vec<UnitInfo>, sd: &ServiceD) -> SdRes 
 
 /// unit-state: 组合 UnitS 快照与 ServiceD 运行状态
 async fn unit_state(name: &str, info: Option<UnitInfo>, sd: &ServiceD) -> SdRes {
+    // 被 mask 的 unit 也要查询 ServiceD, 因为 service 可能仍在运行 (mask 未 --now).
+    if info.as_ref().is_some_and(|i| i.load == LoadSta::Masked) {
+        return match query_running_unit(sd, name).await {
+            Ok(Some(c)) => {
+                let (active, sub) = match query_state(sd, name).await {
+                    Ok(s) => s,
+                    Err(e) => return SdRes::Err(e),
+                };
+                SdRes::UnitState(Some(SdResUnitState {
+                    name: c.name,
+                    description: c.description,
+                    unit_type: c.unit_type,
+                    active,
+                    sub: UnitSubSta::Service(sub),
+                    load: LoadSta::Masked,
+                    enable: EnableSta::Masked,
+                }))
+            }
+            Ok(None) => {
+                let i = info.expect("masked info");
+                SdRes::UnitState(Some(SdResUnitState {
+                    name: i.name,
+                    description: i.description,
+                    unit_type: i.unit_type,
+                    active: UnitSta::Inactive,
+                    sub: UnitSubSta::Service(ServiceSta::Dead),
+                    load: LoadSta::Masked,
+                    enable: EnableSta::Masked,
+                }))
+            }
+            Err(e) => SdRes::Err(e),
+        };
+    }
+
     // 配置优先读 UnitS
     // 若已被 daemon-reload 移除但仍 运行中, 从 ServiceD 取旧配置
-    let (cname, cdesc, ctype, enabled, masked) = match info {
-        Some(i) => (i.name, i.description, i.unit_type, i.enabled, i.masked),
+    let (cname, cdesc, ctype, load, enable) = match info {
+        Some(i) => (i.name, i.description, i.unit_type, i.load, i.enable),
         None => match query_running_unit(sd, name).await {
-            Ok(Some(c)) => (c.name, c.description, c.unit_type, false, false),
+            Ok(Some(c)) => (
+                c.name,
+                c.description,
+                c.unit_type,
+                LoadSta::Loaded,
+                EnableSta::Static,
+            ),
             Ok(None) => return SdRes::UnitState(None),
             Err(e) => return SdRes::Err(e),
         },
@@ -181,17 +221,59 @@ async fn unit_state(name: &str, info: Option<UnitInfo>, sd: &ServiceD) -> SdRes 
         unit_type: ctype,
         active,
         sub: UnitSubSta::Service(sub),
-        enabled,
-        masked,
+        load,
+        enable,
     }))
 }
 
 /// status: 组合 UnitS 快照与 ServiceD 详细状态
 async fn status(name: &str, info: Option<UnitInfo>, sd: &ServiceD) -> SdRes {
-    let (cname, cdesc, enabled, masked) = match info {
-        Some(i) => (i.name, i.description, i.enabled, i.masked),
+    // 被 mask 的 unit 也要查询 ServiceD, 因为 service 可能仍在运行 (mask 未 --now).
+    if info.as_ref().is_some_and(|i| i.load == LoadSta::Masked) {
+        return match query_running_unit(sd, name).await {
+            Ok(Some(c)) => {
+                let st = match query_status(sd, name).await {
+                    Ok(s) => s,
+                    Err(e) => return SdRes::Err(e),
+                };
+                SdRes::Status(SdResUnitStatus {
+                    name: c.name,
+                    description: c.description,
+                    load: LoadSta::Masked,
+                    enable: EnableSta::Masked,
+                    active: st.active,
+                    sub: UnitSubSta::Service(st.sub),
+                    s: SdResUnitS::Service(SdResServiceStatus {
+                        pid: st.pid,
+                        restart_count: st.restart_count,
+                        exit_status: st.exit_status,
+                    }),
+                })
+            }
+            Ok(None) => {
+                let i = info.expect("masked info");
+                SdRes::Status(SdResUnitStatus {
+                    name: i.name,
+                    description: i.description,
+                    load: LoadSta::Masked,
+                    enable: EnableSta::Masked,
+                    active: UnitSta::Inactive,
+                    sub: UnitSubSta::Service(ServiceSta::Dead),
+                    s: SdResUnitS::Service(SdResServiceStatus {
+                        pid: None,
+                        restart_count: 0,
+                        exit_status: None,
+                    }),
+                })
+            }
+            Err(e) => SdRes::Err(e),
+        };
+    }
+
+    let (cname, cdesc, load, enable) = match info {
+        Some(i) => (i.name, i.description, i.load, i.enable),
         None => match query_running_unit(sd, name).await {
-            Ok(Some(c)) => (c.name, c.description, false, false),
+            Ok(Some(c)) => (c.name, c.description, LoadSta::Loaded, EnableSta::Static),
             Ok(None) => return SdRes::Err(format!("Unit {} not found.", name)),
             Err(e) => return SdRes::Err(e),
         },
@@ -205,11 +287,11 @@ async fn status(name: &str, info: Option<UnitInfo>, sd: &ServiceD) -> SdRes {
     SdRes::Status(SdResUnitStatus {
         name: cname,
         description: cdesc,
-        enabled,
-        masked,
+        load,
+        enable,
         active: st.active,
+        sub: UnitSubSta::Service(st.sub),
         s: SdResUnitS::Service(SdResServiceStatus {
-            sub: st.sub,
             pid: st.pid,
             restart_count: st.restart_count,
             exit_status: st.exit_status,

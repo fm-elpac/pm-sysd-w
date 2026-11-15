@@ -2,10 +2,8 @@
 
 pm-sysd-w (胖喵稳哒): Systemd style on Windows.
 
-模仿 systemd 的风格和使用体验, 管理 Windows 上的进程 (service). 不兼容 systemd,
+模仿 systemd 的风格和使用体验, 管理 Windows 上的进程 (process). 不兼容 systemd,
 只实现其中一小部分功能 (subset).
-
-配置文件使用 pm-tc (胖喵模板配置工具) 的集中式 toml 格式.
 
 ## 常用命令
 
@@ -26,11 +24,11 @@ cargo build --release --features cli_log
 
 ## 代码约定
 
-- 源码注释 与 文档注释 一律使用中文 (可以含空格). 标识符与配置关键字使用英文.
+- 源码注释与文档注释一律使用中文. 标识符与配置关键字使用英文.
 - 禁止 `unsafe` 代码 (`#![deny(unsafe_code)]`). 例外: `p_w::console` 与
   `p_w::acl` 两个模块 (Windows API 无安全替代, 必须调用 `unsafe fn`), 它们以
   `#[allow(unsafe_code)]` 覆盖 crate 级 deny, 并把 unsafe 调用集中封装.
-- 模块分工: `cli` (命令行程序 公共模块), `cli::init` (pm-sysd-init 程序),
+- 模块分工: `cli` (命令行程序公共模块), `cli::init` (pm-sysd-init 程序),
   `cli::ctl` (pm-sysd-ctl 程序), `cli::log` (pm-sysd-log 程序), `jsonl`
   (init/ctl 通信协议), `conf` (调用 pm-tc 读取配置文件), `db` (sqlite 数据库
   抽象/封装), `sysd` (服务管理核心), `logd` (日志 核心), `pa` (平台抽象接口),
@@ -38,6 +36,10 @@ cargo build --release --features cli_log
 - 编译产物: 3 个二进制程序 `pm-sysd-init`, `pm-sysd-ctl`, `pm-sysd-log`.
 - 错误处理: 每个模块定义自己的错误枚举, 顶层错误类型用 `From` 汇总;
   错误显示仅为尽力而为.
+
+- 关于 panic: `unwrap()` / `expect()` 只能用于 "按设计不可能失败" 的场景. 一旦
+  panic, 就是代码 BUG, 需要修复. 配置错误, 外部错误 (IPC 连接, 组件退出 等)
+  不应直接 panic; 应使用更优雅的错误处理 (返回错误, 或 `log::error!()` 后丢弃).
 
 - **禁止静默吞掉错误**: 一般不得用 `let _ =` 或 `.ok()` 丢弃 `Result` / 错误;
   出错时使用 `unwrap` / `expect`, 或 `?` 向上传播. 例外: `Drop` 实现与允许
@@ -48,8 +50,8 @@ cargo build --release --features cli_log
 
 ## 文档约定
 
-- 中文 文档为准, 英文翻译 由 AI 自动同步.
-- 文档 内容应该精简. 中文 文档 (以及 代码注释) 也必须使用 英文标点 (ASCII).
+- 中文文档为准, 英文翻译 由 AI 自动同步.
+- 文档内容应该精简. 中文文档 (以及代码注释) 也必须使用英文标点 (ASCII).
 - 开发文档: `doc/dev/` (中文), `doc/dev_en/` (英文).
 - 用户文档: `doc/user/` (中文), `doc/user_en/` (英文).
 - 项目入口 `README.md` 采用中英混写: 一段中文后紧跟一段对应英文翻译.

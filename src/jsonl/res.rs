@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conf::{Unit, UnitType},
-    sysd::{ServiceSta, UnitSta, UnitSubSta},
+    sysd::{EnableSta, LoadSta, UnitSta, UnitSubSta},
 };
 
 /// 一条日志记录
@@ -35,10 +35,10 @@ pub struct SdResUnitState {
     pub active: UnitSta,
     /// 子状态
     pub sub: UnitSubSta,
-    /// 是否 enable
-    pub enabled: bool,
-    /// 是否 mask
-    pub masked: bool,
+    /// 加载状态
+    pub load: LoadSta,
+    /// 启用状态
+    pub enable: EnableSta,
 }
 
 /// unit 的详细状态
@@ -48,13 +48,15 @@ pub struct SdResUnitStatus {
     pub name: String,
     /// 描述
     pub description: String,
-    /// 是否 enable
-    pub enabled: bool,
-    /// 是否 mask
-    pub masked: bool,
+    /// 加载状态
+    pub load: LoadSta,
+    /// 启用状态
+    pub enable: EnableSta,
     /// 激活状态
     pub active: UnitSta,
-    /// 按 unit 类型区分的 特有状态
+    /// 子状态
+    pub sub: UnitSubSta,
+    /// 按 unit 类型区分的特有状态
     pub s: SdResUnitS,
 }
 
@@ -71,8 +73,6 @@ pub enum SdResUnitS {
 /// service 特有状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdResServiceStatus {
-    /// service 子状态
-    pub sub: ServiceSta,
     /// 进程 pid (运行中)
     pub pid: Option<u32>,
     /// 自动重启次数
@@ -96,8 +96,8 @@ pub struct SdResTimerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "res", content = "data", rename_all = "kebab-case")]
 pub enum SdRes {
-    /// 操作成功 (无需额外数据)
-    Ok,
+    /// 操作成功 (可选提示消息, 由 ctl 打印)
+    Ok(Option<String>),
     /// 操作失败 (携带错误消息, 尽力而为)
     Err(String),
     /// `list-units` 结果

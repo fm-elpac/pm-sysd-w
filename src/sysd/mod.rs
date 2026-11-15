@@ -1,21 +1,24 @@
-//! 服务管理 核心逻辑.
+//! 服务管理核心逻辑.
 //!
-//! 管理由 pm-sysd-init 启动的 进程 (service). 初版只支持 service 一种 unit 类型.
+//! 管理由 pm-sysd-init 启动的进程 (process).
+//! 初版只支持 service 一种 unit 类型.
 //!
-//! 采用多 actor 架构: 每个关键组件是 `tokio::spawn` 的 async task, 持有私有状态.
-//! 组件之间通过 channel 消息通信 (事件驱动).
-//!
+//! 采用多 actor 架构: 每个关键组件是 `tokio::spawn` 的 async task, 持有自己的内部状态.
+//! 组件之间通过 channel 发送消息通信 (事件驱动).
 //!
 //! ## 状态枚举
 //!
 //! 尽量与 systemd 保持一致, 不要随便修改.
 //!
-//! - `UnitSta`: systemd 定义的所有 unit 的可能状态.
+//! - `UnitSta`: systemd 定义的所有 unit 的可能状态 (active).
+//! - `LoadSta`: unit 加载状态 (对应 `UnitLoadState`).
 //! - `ServiceSta`: systemd 定义的所有 service 的可能状态.
 //! - `TimerSta`: systemd 定义的所有 timer 的可能状态.
-//! - `UnitSubSta`: 用于包装 `ServiceSta` 与 `TimerSta`.
+//! - `TargetSta`: systemd 定义的所有 target 的可能状态.
+//! - `EnableSta`: unit 启用状态 (对应 `UnitFileState`, 即 `is-enabled` 输出).
+//! - `UnitSubSta`: 用于包装 `ServiceSta` 与 `TimerSta` 等.
 //!
-//! `ServiceSta` 和 `TimerSta` 可以 (有损) 映射到 `UnitSta`.
+//! `ServiceSta`, `TimerSta`, `TargetSta` 可以 (有损) 映射到 `UnitSta`.
 
 use std::fmt;
 
@@ -30,12 +33,17 @@ mod sys_d;
 mod timer_d;
 mod timer_s;
 mod unit_d;
+mod util;
 
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod test_util;
+
 pub use error::SysdError;
 pub use sys_d::{SysD, SysDM};
+pub use util::send_reply;
 
 /// 内置 target: `default.target`
 ///
@@ -49,9 +57,7 @@ pub const TARGET_EXIT: &str = "exit.target";
 /// unit 的激活状态 (对应 systemd 的 `UnitActiveState`).
 ///
 /// 这是 systemd 定义的所有 unit 的可能状态.
-///
-/// 当前版本 实际只使用 `Active`, `Inactive`, `Failed`.
-/// 其余状态为后续机制预留.
+/// 当前版本只使用其中的一部分.
 ///
 /// 尽量与 systemd 保持一致, 不要随便修改.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,16 +75,44 @@ pub enum UnitSta {
     Deactivating,
     /// 维护中
     Maintenance,
-    /// reloading (unit 正在 reload)
+    /// 重新加载中 (unit 正在 reload)
     Reloading,
     /// 正在刷新资源
     Refreshing,
 }
 
-/// service 的子状态 (对应 systemd 的 `ServiceState`).
+/// unit 的加载状态 (对应 systemd 的 `UnitLoadState`).
+///
+/// 这是 systemd 定义的所有 unit 的可能状态.
+/// 当前版本只使用其中的一部分.
+///
+/// `systemctl list-units` 的 LOAD 列常见值:
+/// `loaded`, `not-found`, `bad-setting`, `error`, `masked`.
+///
+/// 尽量与 systemd 保持一致, 不要随便修改.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoadSta {
+    /// 尚未加载 (内部占位)
+    Stub,
+    /// 已加载
+    Loaded,
+    /// unit 文件不存在
+    NotFound,
+    /// 关键设置解析失败
+    BadSetting,
+    /// 其它错误
+    Error,
+    /// 已合并到其它 unit
+    Merged,
+    /// 已屏蔽
+    Masked,
+}
+
+/// service 的状态 (对应 systemd 的 `ServiceState`).
 ///
 /// 这是 systemd 定义的所有 service 的可能状态.
-/// 当前版本只使用其中一部分.
+/// 当前版本只使用其中的一部分.
 ///
 /// 尽量与 systemd 保持一致, 不要随便修改.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,21 +166,21 @@ pub enum ServiceSta {
     FinalSigkill,
     /// 失败
     Failed,
-    /// 自动重启前 的 dead
+    /// 自动重启前的 dead
     DeadBeforeAutoRestart,
-    /// 自动重启前 的 failed
+    /// 自动重启前的 failed
     FailedBeforeAutoRestart,
-    /// 资源被保留 的 dead
+    /// 资源被保留的 dead
     DeadResourcesPinned,
     /// 自动重启中
     AutoRestart,
-    /// 自动重启 已排队
+    /// 自动重启已排队
     AutoRestartQueued,
     /// 清理中
     Cleaning,
 }
 
-/// timer 的子状态 (对应 systemd 的 `TimerState`).
+/// timer 的状态 (对应 systemd 的 `TimerState`).
 ///
 /// 这是 systemd 定义的所有 timer 的可能状态.
 /// 当前版本未实现 timer, 枚举为后续机制预留.
@@ -167,32 +201,76 @@ pub enum TimerSta {
     Failed,
 }
 
-/// target 状态 (保留)
+/// target 的状态 (对应 systemd 的 `TargetState`).
+///
+/// 这是 systemd 定义的所有 target 的可能状态.
+///
+/// 尽量与 systemd 保持一致, 不要随便修改.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TargetSta {
+    /// 未激活 (target 未到达)
+    Dead,
     /// 已激活 (target 已到达)
     Active,
 }
 
+/// unit 的启用状态 (对应 systemd 的 `UnitFileState`, 即 `is-enabled` 输出).
+///
+/// 这是 systemd 定义的所有可能状态.
+/// 当前版本只使用其中的一部分.
+///
+/// 尽量与 systemd 保持一致, 不要随便修改.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnableSta {
+    /// 已启用 (持久)
+    Enabled,
+    /// 已启用 (仅运行时)
+    EnabledRuntime,
+    /// 已链接 (符号链接到查找路径之外)
+    Linked,
+    /// 已链接 (仅运行时)
+    LinkedRuntime,
+    /// 别名
+    Alias,
+    /// 已屏蔽
+    Masked,
+    /// 已屏蔽 (仅运行时)
+    MaskedRuntime,
+    /// 静态 (无 [Install] 配置, 不能 enable/disable)
+    Static,
+    /// 已禁用
+    Disabled,
+    /// 间接启用 (被其它 unit 依赖)
+    Indirect,
+    /// 生成 (generator 产生)
+    Generated,
+    /// 临时 (transient unit)
+    Transient,
+    /// 无效 (unit 文件损坏)
+    Bad,
+}
+
 /// unit 子状态 (按 unit 类型区分).
 ///
-/// 用于包装 [`ServiceSta`] 与 [`TimerSta`].
+/// 用于包装 [`ServiceSta`] 与 [`TimerSta`] 等.
 ///
-/// 序列化为子状态字符串 (例如 `"running"`).
+/// 序列化时带类型标记 (例如 `{"type": "service", "data": "running"}`),
+/// 反序列化可无损还原类型, 不会把 timer 误还原为 service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type", content = "data", rename_all = "kebab-case")]
 pub enum UnitSubSta {
-    /// service unit 子状态
+    /// service unit
     Service(ServiceSta),
-    /// timer unit 子状态
+    /// timer unit
     Timer(TimerSta),
     /// target unit
     Target(TargetSta),
 }
 
 impl UnitSta {
-    /// 显示/序列化 文本.
+    /// 显示/序列化文本
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -203,6 +281,21 @@ impl UnitSta {
             Self::Maintenance => "maintenance",
             Self::Reloading => "reloading",
             Self::Refreshing => "refreshing",
+        }
+    }
+}
+
+impl LoadSta {
+    /// 显示/序列化文本
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stub => "stub",
+            Self::Loaded => "loaded",
+            Self::NotFound => "not-found",
+            Self::BadSetting => "bad-setting",
+            Self::Error => "error",
+            Self::Merged => "merged",
+            Self::Masked => "masked",
         }
     }
 }
@@ -262,13 +355,35 @@ impl TargetSta {
     /// 显示/序列化文本
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Dead => "dead",
             Self::Active => "active",
         }
     }
 }
 
-impl UnitSubSta {
+impl EnableSta {
     /// 显示/序列化文本
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::EnabledRuntime => "enabled-runtime",
+            Self::Linked => "linked",
+            Self::LinkedRuntime => "linked-runtime",
+            Self::Alias => "alias",
+            Self::Masked => "masked",
+            Self::MaskedRuntime => "masked-runtime",
+            Self::Static => "static",
+            Self::Disabled => "disabled",
+            Self::Indirect => "indirect",
+            Self::Generated => "generated",
+            Self::Transient => "transient",
+            Self::Bad => "bad",
+        }
+    }
+}
+
+impl UnitSubSta {
+    /// 内部状态文本 (不含外层状态)
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Service(s) => s.as_str(),
@@ -279,6 +394,12 @@ impl UnitSubSta {
 }
 
 impl fmt::Display for UnitSta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for LoadSta {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -302,9 +423,16 @@ impl fmt::Display for TargetSta {
     }
 }
 
-impl fmt::Display for UnitSubSta {
+impl fmt::Display for EnableSta {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// 模仿 systemd 的显示格式, 比如 `active(exited)`
+impl fmt::Display for UnitSubSta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", UnitSta::from(*self).as_str(), self.as_str())
     }
 }
 
@@ -365,10 +493,14 @@ impl From<TimerSta> for UnitSta {
     }
 }
 
-/// `TargetSta` -> `UnitSta` (保留)
+/// `TargetSta` -> `UnitSta` 的 (有损) 映射.
+///
+/// 映射规则与 systemd 保持一致.
+/// (参考 systemd `src/core/target.c` 的 `state_translation_table`)
 impl From<TargetSta> for UnitSta {
     fn from(s: TargetSta) -> Self {
         match s {
+            TargetSta::Dead => UnitSta::Inactive,
             TargetSta::Active => UnitSta::Active,
         }
     }

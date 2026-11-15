@@ -158,9 +158,45 @@ import-environment
 daemon-reload
 soft-reboot
 exit
+sqlite-vacuum
 ```
 
 `enable` / `disable` support `--now` (e.g. `enable --now`).
+
+`mask` behavior (consistent with systemd):
+
+- `mask` supports `--now`; by default it only masks and does not stop a running
+  unit, while `--now` also stops it.
+- Running `mask` on a unit that does not exist in the config prints a warning,
+  but the operation still succeeds.
+- A masked unit is treated as nonexistent: it is not listed by `list-units`, and
+  its config details are not shown (`show` / `cat` / `list-dependencies` report
+  the unit as not found).
+- Running `status` on a masked unit returns unit information showing `masked`;
+  if the service is still running, the other state (active / pid, etc.) comes
+  from the running unit's old config.
+- `start` / `restart` / `reload-or-restart` / `try-restart` /
+  `try-reload-or-restart` report an error for a masked unit and do not start it.
+
+Command behavior notes:
+
+- Unit names without a suffix get `.service` appended automatically (e.g.
+  `status test` equals `status test.service`); the same applies to
+  `pm-sysd-log -u` / `--unit`.
+- `cat` prints pretty JSON (it does not mimic systemd's unit file format).
+- `list-units` / `status` / `list-timers` output format and column alignment
+  mimic `systemctl` as closely as possible; fields that are not relevant to this
+  project are omitted (see the `src/cli/ctl/` module comments).
+- `is-active` exit code: `0` active, `3` not active (inactive/failed), `4`
+  unknown.
+- `is-failed` exit code: `0` failed, `1` not failed, `4` unknown.
+- `is-enabled` exit code (mimics systemd): `0` enabled/enabled-runtime/alias/
+  static/indirect/generated/transient, `1` linked/linked-runtime/masked/
+  masked-runtime/disabled/bad, `4` unknown (not-found).
+- `daemon-reload` re-reads the config file and re-reads enable/mask state from
+  the SQLite database; while a reload is in progress, `enable` / `disable` /
+  `reenable` / `mask` / `unmask` report an error, and concurrent `daemon-reload`
+  requests are rejected.
 
 Common options:
 
@@ -213,3 +249,5 @@ Common options:
   services (not a Windows reboot).
 - External signals: SIGTERM on Linux and Ctrl+C on Windows also trigger a
   graceful exit.
+- Before exiting (before soft-reboot restarts itself), pm-sysd-init runs a
+  vacuum on the database.

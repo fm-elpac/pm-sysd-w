@@ -87,10 +87,11 @@ Log records (written by the `logd` module).
 
 ### Indexes
 
-| Index          | Table | Column | Description                                |
-| -------------- | ----- | ------ | ------------------------------------------ |
-| `idx_log_unit` | `log` | `unit` | Filter logs by unit (queries)              |
-| `idx_log_ts`   | `log` | `ts`   | Automatic log cleanup / time-based queries |
+| Index           | Table | Column      | Description                                   |
+| --------------- | ----- | ----------- | --------------------------------------------- |
+| `idx_log_unit`  | `log` | `unit, id`  | Filter logs by unit (queries, ordered by id)  |
+| `idx_log_level` | `log` | `level, id` | Filter logs by level (queries, ordered by id) |
+| `idx_log_ts`    | `log` | `ts`        | Automatic log cleanup / time-based queries    |
 
 ## Access
 

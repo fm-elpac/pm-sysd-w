@@ -1,13 +1,29 @@
 //! UnitS: unit 配置与 mask/enable 持久状态的内存数据库.
 //!
-//! UnitS 只持有数据与 读取/更新 方法, 不做任何 IO. 由 UnitD (通过 [`super::actor::UnitDSM`]
+//! UnitS 只持有数据与 读取/更新 方法, 不做任何 IO. 由 UnitD (通过 [`super::sm::Sm`]
 //! 状态机) 单线程访问, 无需内部加锁.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::conf::Unit;
+use crate::{
+    conf::{Unit, UnitType},
+    sysd::{EnableSta, LoadSta},
+};
 
 use super::query::UnitInfo;
+
+/// 根据 unit 名称后缀推断类型 (配置中已消失的 unit)
+pub fn unit_type_by_name(name: &str) -> Option<UnitType> {
+    if name.ends_with(".service") {
+        Some(UnitType::Service)
+    } else if name.ends_with(".timer") {
+        Some(UnitType::Timer)
+    } else if name.ends_with(".target") {
+        Some(UnitType::Target)
+    } else {
+        None
+    }
+}
 
 /// 单个 unit 的内存配置条目 (静态配置, 只读)
 #[derive(Clone)]
@@ -61,10 +77,10 @@ impl UnitS {
             })
             .collect();
 
-        let mut masked: HashSet<String> = me.masked.into_iter().collect();
+        let masked: HashSet<String> = me.masked.into_iter().collect();
         let mut enabled: HashSet<String> = me.enabled.into_iter().collect();
-        // 清理已不存在 unit 的持久状态缓存
-        masked.retain(|n| current.contains_key(n));
+        // enable 状态只对当前配置中的 unit 有效; mask 状态保留, 因为被 mask 的
+        // unit 即使配置中不存在也仍然视为不存在 (但 mask 状态本身需要保留).
         enabled.retain(|n| current.contains_key(n));
 
         Self {
@@ -100,6 +116,34 @@ impl UnitS {
         self.me.masked.contains(name)
     }
 
+    /// 读取 unit 的加载状态.
+    ///
+    /// 被 mask 的 unit 即使配置中不存在也返回 `Masked`; 其它情况返回 `Loaded`.
+    pub fn load_sta(&self, name: &str) -> LoadSta {
+        if self.masked(name) {
+            LoadSta::Masked
+        } else {
+            LoadSta::Loaded
+        }
+    }
+
+    /// 读取 unit 的启用状态 (只用于当前配置中存在的 unit)
+    pub fn enable_sta(&self, name: &str) -> EnableSta {
+        if self.masked(name) {
+            EnableSta::Masked
+        } else if self.enabled(name) {
+            EnableSta::Enabled
+        } else if self
+            .get(name)
+            .and_then(|u| u.install.wanted_by.as_deref())
+            .is_some()
+        {
+            EnableSta::Disabled
+        } else {
+            EnableSta::Static
+        }
+    }
+
     /// 设置 enable 状态 (仅更新内存缓存, 持久化由 UnitD 负责)
     pub fn set_enabled(&mut self, name: &str, value: bool) {
         if value {
@@ -118,36 +162,43 @@ impl UnitS {
         }
     }
 
-    /// 读取一个 unit 的查询快照 (不存在则 None)
+    /// 读取一个 unit 的查询快照 (不存在且未 mask 则 None).
+    ///
+    /// 被 mask 的 unit 无论是否在配置中, 都返回一个仅表示 mask 状态的快照.
     pub fn info_of(&self, name: &str) -> Option<UnitInfo> {
+        if self.masked(name) {
+            return Some(UnitInfo {
+                name: name.to_string(),
+                description: String::new(),
+                unit_type: unit_type_by_name(name).unwrap_or(UnitType::Service),
+                load: LoadSta::Masked,
+                enable: EnableSta::Masked,
+            });
+        }
         let c = self.get(name)?;
         Some(UnitInfo {
             name: c.name.clone(),
             description: c.description.clone(),
             unit_type: c.unit_type,
-            enabled: self.enabled(name),
-            masked: self.masked(name),
+            load: self.load_sta(name),
+            enable: self.enable_sta(name),
         })
     }
 
-    /// 读取全部 unit 的查询快照 (按名称排序)
+    /// 读取全部 unit 的查询快照 (按名称排序, 不包含被 mask 的 unit)
     pub fn all_infos(&self) -> Vec<UnitInfo> {
         self.all_names()
-            .iter()
-            .map(|n| self.info_of(n).expect("unit exists"))
+            .into_iter()
+            .filter(|n| !self.masked(n))
+            .map(|n| self.info_of(&n).expect("unit exists"))
             .collect()
-    }
-
-    /// 用于 daemon-reload 重建
-    pub fn get_me(&self) -> UnitSME {
-        self.me.clone()
     }
 
     /// 应该随指定 target 启动的 unit 名称 (已 enable 且未 mask, `WantedBy` 匹配)
     pub fn target_units(&self, target: &str) -> Vec<String> {
         let mut out = Vec::new();
         for name in self.current.keys() {
-            if self.enabled(name) && !self.masked(name) {
+            if self.enable_sta(name) == EnableSta::Enabled {
                 if let Some(w) = self.current.get(name).and_then(|e| e.wanted_by()) {
                     if w == target {
                         out.push(name.clone());

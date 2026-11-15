@@ -1,405 +1,335 @@
-//! UnitD 状态机 (仅计算/决策, 不执行 IO).
+//! UnitD actor 外壳 (tokio async task).
 //!
-//! UnitDSM 持有 [`UnitS`] 与当前 target 作为状态. UnitD 把 [`UnitDM`] 消息喂给
-//! 状态机, 再执行状态机返回的 [`SmActionR`] / [`SmActionD`] 列表. 状态机不接触
-//! `oneshot::Sender`, 回执由 UnitD 在执行动作时注入/发送.
+//! [`UnitD`] 是外部句柄 (MPSC 发送端), 外部消息 [`UnitDM`] 以内部消息 [`M::M`]
+//! 包装进入 actor; daemon-reload / 数据库写入 / ServiceD 退出等待等后台 task 完成
+//! 后通过 [`M::ReloadOk`] / [`M::WriteDbDone`] / [`M::ExitServiceDone`] 等内部事件
+//! 回报. 外部消息与内部事件统一交给 [`Sm`] 状态机决策, 再逐条执行状态机输出的
+//! [`SmOutput`] 动作. actor 本身不包含业务逻辑, 只执行状态机要求的 IO 请求.
+
+use log::error;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    conf::{Conf, Unit, UnitType},
-    jsonl::{
-        SdReq, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdRes,
+    conf::{Conf, Unit},
+    db::DbClient,
+    jsonl::{SdReq, SdRes},
+    logd::Logd,
+    sysd::{
+        SysdError, send_reply,
+        service_d::{ServiceD, ServiceDM},
     },
-    sysd::{SysdError, TARGET_DEFAULT, TARGET_EXIT},
 };
-
-use crate::sysd::service_d::ServiceCmdUnit;
 
 use super::{
-    query::{QueryKind, QueryReq},
-    unit_s::UnitS,
-    unit_type_by_name,
+    load::{load_masked_enabled, spawn_reload, write_unit},
+    query::spawn_query,
+    sm::{PendingWrite, Sm, SmInput, SmOutput, WriteUnit},
+    unit_s::{UnitS, UnitSME},
 };
 
-/// 状态机输出的动作 (由 UnitD 执行)
+/// 发给 UnitD 的外部消息 (pub API).
 ///
-/// 对应 `oneshot::Sender<Result<(), SysdError>>` 回执.
-pub enum SmActionD {
-    /// 写一条日志 (调用 logd)
-    #[allow(dead_code)]
-    Log {
-        level: &'static str,
-        unit: Option<String>,
-        msg: String,
-    },
-    /// 立即返回 StartDefaultTarget / Exit 响应
-    ///
-    /// 当前实现把回执透传给 ServiceD (无阻塞转发), 故该变体暂时未使用
-    #[allow(dead_code)]
-    Reply(Result<(), SysdError>),
-    /// 批量启动 (转发给 ServiceD)
-    SendStartMany(Vec<(String, Unit)>),
-    // 转发命令给 TimerD (预留)
-    //SendTimer,
-    /// 向 ServiceD 发送退出消息 (ServiceD 停止所有 service 并退出)
-    ExitService,
-    /// 退出 UnitD 主循环
-    Exit,
+/// 每条消息自带 oneshot 回执, 由调用方构造.
+pub enum UnitDM {
+    /// 处理一条 ctl 请求 (直接复用 jsonl 类型), 回执为 `SdRes`
+    SdReq(SdReq, oneshot::Sender<SdRes>),
+    /// 启动默认 target, 回执为命令结果
+    StartDefaultTarget(oneshot::Sender<Result<(), SysdError>>),
+    /// 停止所有 unit, 然后退出本 actor 主循环
+    Exit(oneshot::Sender<Result<(), SysdError>>),
 }
 
-/// 状态机输出的动作 (由 UnitD 执行)
-///
-/// 对应 `oneshot::Sender<SdRes>` 回执.
-pub enum SmActionR {
-    /// 写一条日志 (调用 logd)
-    Log {
-        level: &'static str,
-        unit: Option<String>,
-        msg: String,
-    },
-    /// 立即返回 SdReq 响应
-    Reply(SdRes),
-    /// 给自己发送进一步操作
-    SendSelf(SdReq),
-    /// 转发单个 unit 操作给 ServiceD
-    SendService(ServiceCmdUnit),
-    /// 转发命令给 TimerD (预留)
-    //SendTimer,
-    /// 查询 (组合 UnitD 与 ServiceD 数据), 完成后回复 SdReq 调用方
-    QueryService(QueryReq),
-    /// 写数据库 (mask / enable), 完成后回复 SdReq 调用方 (成功 Ok / 失败 Err)
-    WriteDb(WriteUnit),
-    /// daemon-reload
-    Reload,
+/// 发给 actor 的内部消息 (外部消息与内部事件共用同一通道)
+pub enum M {
+    /// 外部消息包装
+    M(UnitDM),
+    /// daemon-reload 加载完成 (携带配置, 从数据库重新读取的 mask/enable 状态, 与原始回执)
+    ReloadOk(Conf, UnitSME, oneshot::Sender<SdRes>),
+    /// daemon-reload 加载失败 (携带错误消息与原始回执)
+    ReloadErr(String, oneshot::Sender<SdRes>),
+    /// 数据库写入完成 (携带结果, 对应的后续操作, 与原始回执)
+    WriteDbDone(Result<(), SysdError>, PendingWrite, oneshot::Sender<SdRes>),
+    /// ServiceD 已停止所有 service (携带结果与原始回执)
+    ExitServiceDone(
+        Result<(), SysdError>,
+        oneshot::Sender<Result<(), SysdError>>,
+    ),
 }
 
-/// 向数据库写入 enable / mask 的单个更新
-#[derive(Debug, Clone)]
-pub struct WriteUnit {
-    pub name: String,
-    pub enabled: Option<bool>,
-    pub masked: Option<bool>,
+/// UnitD 句柄
+#[derive(Clone)]
+pub struct UnitD {
+    tx: mpsc::Sender<M>,
 }
 
-/// enable / disable / reenable 合并操作的参数
-#[derive(Clone, Copy)]
-enum EnableOp {
-    Enable { now: bool },
-    Disable { now: bool },
-    Reenable,
-}
+impl UnitD {
+    /// 启动 UnitD actor (并启动其依赖的 ServiceD), 返回句柄.
+    pub fn spawn(db: DbClient, logd: Logd, conf_path: String, units: Vec<Unit>) -> Self {
+        let sd = ServiceD::spawn(logd.clone());
 
-/// mask / unmask 合并操作的参数
-#[derive(Clone, Copy)]
-enum MaskOp {
-    Mask,
-    Unmask,
-}
+        let (tx, rx) = mpsc::channel(64);
+        let self_tx = tx.clone();
 
-/// UnitD 状态机
-pub struct UnitDSM {
-    /// 状态: unit 配置与 enable/mask 持久状态
-    units: UnitS,
-    /// 当前 target (运行中的 target), 默认 `default.target`
-    current_target: String,
-}
-
-impl UnitDSM {
-    /// 用 初始 UnitS 创建
-    pub fn new(units: UnitS) -> Self {
-        Self {
-            units,
-            current_target: TARGET_DEFAULT.to_string(),
-        }
-    }
-
-    /// 处理启动默认 target 请求
-    pub fn handle_start_default_target(&self) -> Vec<SmActionD> {
-        let services: Vec<(String, Unit)> = self
-            .units
-            .target_units(TARGET_DEFAULT)
-            .into_iter()
-            .map(|name| {
-                let conf = self.units.get(&name).cloned().expect("target unit exists");
-                (name, conf)
-            })
-            .collect();
-        vec![SmActionD::SendStartMany(services)]
-    }
-
-    /// 处理退出请求
-    pub fn handle_exit(&mut self) -> Vec<SmActionD> {
-        // 退出过程中先把当前 target 改成 `exit.target`
-        self.current_target = TARGET_EXIT.to_string();
-        vec![SmActionD::ExitService, SmActionD::Exit]
-    }
-
-    /// 处理 daemon-reload 加载完成
-    pub fn handle_reload_ok(&mut self, conf: Conf) -> Vec<SmActionR> {
-        // 用新配置重建 UnitS (daemon-reload 时整体替换)
-        self.units = UnitS::new(conf.units, self.units.get_me());
-
-        let mut a = Vec::new();
-        for w in &conf.warnings {
-            a.push(SmActionR::Log {
-                level: "warn",
-                unit: None,
-                msg: w.clone(),
-            });
-        }
-        a.push(SmActionR::Log {
-            level: "info",
-            unit: None,
-            msg: "daemon-reload".to_string(),
-        });
-        a.push(SmActionR::Reply(SdRes::Ok));
-        a
-    }
-
-    /// 处理一条 ctl 请求 (SdReq)
-    pub fn handle_sd_req(&mut self, req: SdReq) -> Vec<SmActionR> {
-        match req {
-            SdReq::UnitdRO(r) => self.handle_unitd_ro(r),
-            SdReq::UnitD(r) => self.handle_unitd(r),
-            SdReq::UnitRO(r) => self.handle_unit_ro(r),
-            SdReq::Unit(r) => self.handle_unit(r),
-            // 不支持其余请求
-            _ => {
-                vec![res_err("unsupported request")]
-            }
-        }
-    }
-
-    fn handle_unitd_ro(&mut self, req: SdReqUnitdRO) -> Vec<SmActionR> {
-        match req {
-            SdReqUnitdRO::GetDefault => {
-                // 目前不支持 自定义 target, 所以固定写死
-                vec![SmActionR::Reply(SdRes::DefaultTarget(
-                    TARGET_DEFAULT.to_string(),
-                ))]
-            }
-            SdReqUnitdRO::ListUnits => vec![SmActionR::QueryService(QueryReq {
-                kind: QueryKind::ListUnits {
-                    target: self.current_target.clone(),
-                    infos: self.units.all_infos(),
-                },
-            })],
-            SdReqUnitdRO::ListTimers => vec![SmActionR::Reply(SdRes::Timers(vec![]))],
-            SdReqUnitdRO::ShowEnvironment => vec![res_err("TODO")],
-        }
-    }
-
-    fn handle_unitd(&mut self, req: SdReqUnitd) -> Vec<SmActionR> {
-        match req {
-            SdReqUnitd::SetDefault { target } => {
-                if target != TARGET_DEFAULT {
-                    vec![res_err(format!("unknown target `{}`", target))]
-                } else {
-                    vec![SmActionR::Reply(SdRes::Ok)]
+        tokio::spawn(async move {
+            // 启动时从数据库加载 mask / enable 列表到 UnitS
+            let me = match load_masked_enabled(&db).await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("load masked / enabled list: {}", e);
+                    UnitSME::default()
                 }
-            }
-            SdReqUnitd::DaemonReload => vec![SmActionR::Reload],
-            SdReqUnitd::SetEnvironment | SdReqUnitd::UnsetEnvironment => {
-                vec![res_err("TODO")]
-            }
-        }
-    }
-
-    fn handle_unit_ro(&mut self, req: SdReqUnitRO) -> Vec<SmActionR> {
-        let name = req.name;
-        match req.op {
-            SdReqUnitOpRO::UnitState => {
-                let info = self.units.info_of(&name);
-                vec![SmActionR::QueryService(QueryReq {
-                    kind: QueryKind::UnitState { name, info },
-                })]
-            }
-            SdReqUnitOpRO::Status => {
-                let info = self.units.info_of(&name);
-                vec![SmActionR::QueryService(QueryReq {
-                    kind: QueryKind::Status { name, info },
-                })]
-            }
-            SdReqUnitOpRO::Config => match self.units.get(&name) {
-                Some(c) => vec![SmActionR::Reply(SdRes::Config(c.clone()))],
-                None => vec![res_err(not_found_msg(&name))],
-            },
-            SdReqUnitOpRO::ListDependencies => {
-                if self.units.contains(&name) {
-                    vec![SmActionR::Reply(SdRes::Dependencies(vec![]))]
-                } else {
-                    vec![res_err(not_found_msg(&name))]
-                }
-            }
-        }
-    }
-
-    fn handle_unit(&mut self, req: SdReqUnit) -> Vec<SmActionR> {
-        let name = req.name;
-        match req.op {
-            SdReqUnitOp::Enable { now } => self.handle_enable_op(name, EnableOp::Enable { now }),
-            SdReqUnitOp::Disable { now } => self.handle_enable_op(name, EnableOp::Disable { now }),
-            SdReqUnitOp::Reenable => self.handle_enable_op(name, EnableOp::Reenable),
-            SdReqUnitOp::Mask => self.handle_mask_op(name, MaskOp::Mask),
-            SdReqUnitOp::Unmask => self.handle_mask_op(name, MaskOp::Unmask),
-            // 统一转发 ServiceD
-            op @ (SdReqUnitOp::Start
-            | SdReqUnitOp::Stop
-            | SdReqUnitOp::Kill
-            | SdReqUnitOp::Restart
-            | SdReqUnitOp::TryRestart
-            | SdReqUnitOp::Reload
-            | SdReqUnitOp::ReloadOrRestart
-            | SdReqUnitOp::TryReloadOrRestart
-            | SdReqUnitOp::ResetFailed) => self.handle_service_op(name, op),
-            // 暂不支持
-            SdReqUnitOp::Preset | SdReqUnitOp::Clean => vec![res_err("TODO")],
-        }
-    }
-
-    /// enable / disable / reenable 合并处理
-    fn handle_enable_op(&mut self, name: String, op: EnableOp) -> Vec<SmActionR> {
-        // enable / reenable 写入 true, disable 写入 false
-        let enabled = !matches!(op, EnableOp::Disable { .. });
-
-        if enabled {
-            // enable / reenable 需要校验 target 与 masked, 并读取 unit 配置
-            let Some(unit) = self.units.get(&name).cloned() else {
-                return vec![res_err(not_found_msg(&name))];
             };
-            let masked = self.units.masked(&name);
-            if let Err(e) = validate_enable(&unit, masked) {
-                return vec![res_err(e)];
-            }
-        } else if !self.units.contains(&name) {
-            return vec![res_err(not_found_msg(&name))];
-        }
+            Actor::new(rx, self_tx, logd, db, conf_path, sd, units, me)
+                .run()
+                .await;
+        });
 
-        self.units.set_enabled(&name, enabled);
-
-        let msg = match op {
-            EnableOp::Enable { .. } => "enabled",
-            EnableOp::Disable { .. } => "disabled",
-            EnableOp::Reenable => "reenabled",
-        };
-
-        let mut a = vec![
-            SmActionR::WriteDb(WriteUnit {
-                name: name.clone(),
-                enabled: Some(enabled),
-                masked: None,
-            }),
-            SmActionR::Log {
-                level: "info",
-                unit: Some(name.clone()),
-                msg: msg.to_string(),
-            },
-        ];
-
-        match op {
-            EnableOp::Enable { now: true } => {
-                a.push(SmActionR::SendSelf(SdReq::Unit(SdReqUnit {
-                    name,
-                    op: SdReqUnitOp::Start,
-                })));
-            }
-            EnableOp::Disable { now: true } => {
-                a.push(SmActionR::SendSelf(SdReq::Unit(SdReqUnit {
-                    name,
-                    op: SdReqUnitOp::Stop,
-                })));
-            }
-            _ => {
-                a.push(SmActionR::Reply(SdRes::Ok));
-            }
-        }
-        a
+        Self { tx }
     }
 
-    /// mask / unmask 合并处理
-    fn handle_mask_op(&mut self, name: String, op: MaskOp) -> Vec<SmActionR> {
-        if !self.units.contains(&name) {
-            return vec![res_err(not_found_msg(&name))];
-        }
-        let masked = matches!(op, MaskOp::Mask);
-        self.units.set_masked(&name, masked);
+    /// 发送一条消息 (等待投递完成, 不等待处理/回执)
+    pub async fn send(&self, m: UnitDM) -> Result<(), mpsc::error::SendError<UnitDM>> {
+        self.tx.send(M::M(m)).await.map_err(|e| {
+            mpsc::error::SendError(match e.0 {
+                M::M(m) => m,
+                _ => unreachable!("UnitD::send never sends internal events"),
+            })
+        })
+    }
+}
 
-        let mut a = vec![SmActionR::WriteDb(WriteUnit {
-            name: name.clone(),
-            masked: Some(masked),
-            enabled: None,
-        })];
-        match op {
-            // 先写数据库, 再停止 (若正在运行)
-            MaskOp::Mask => a.push(SmActionR::SendSelf(SdReq::Unit(SdReqUnit {
-                name,
-                op: SdReqUnitOp::Stop,
-            }))),
-            MaskOp::Unmask => a.push(SmActionR::Reply(SdRes::Ok)),
+/// actor 本体
+pub struct Actor {
+    /// 持有状态机
+    sm: Sm,
+    /// 消息接收端
+    rx: mpsc::Receiver<M>,
+    /// 消息发送端 (供自己与后台 task 回报内部事件)
+    tx: mpsc::Sender<M>,
+    /// Logd 句柄
+    logd: Logd,
+    /// 数据库句柄 (用于 enable/mask 持久化)
+    db: DbClient,
+    /// 配置文件路径 (用于 daemon-reload)
+    conf_path: String,
+    /// ServiceD 句柄
+    sd: ServiceD,
+    /// 退出标记: 收到 [`SmOutput::Exit`] 后主循环退出
+    exit: bool,
+}
+
+impl Actor {
+    /// 创建 actor (并构造初始状态机)
+    fn new(
+        rx: mpsc::Receiver<M>,
+        tx: mpsc::Sender<M>,
+        logd: Logd,
+        db: DbClient,
+        conf_path: String,
+        sd: ServiceD,
+        units: Vec<Unit>,
+        me: UnitSME,
+    ) -> Self {
+        Self {
+            sm: Sm::new(UnitS::new(units, me)),
+            rx,
+            tx,
+            logd,
+            db,
+            conf_path,
+            sd,
+            exit: false,
         }
-        a
     }
 
-    /// 统一处理转发给 ServiceD 的单个 unit 操作
-    fn handle_service_op(&self, name: String, op: SdReqUnitOp) -> Vec<SmActionR> {
-        // ResetFailed 且 name 为空 = 清除全部, 无需 unit 类型判断.
-        let reset_all = match &op {
-            SdReqUnitOp::ResetFailed => name.is_empty(),
-            _ => false,
-        };
-        if reset_all {
-            return vec![SmActionR::SendService(ServiceCmdUnit {
-                name,
-                conf: None,
-                op,
-            })];
-        }
-
-        // 仅 Start 需要先检查 masked (与之前行为一致).
-        let start = match &op {
-            SdReqUnitOp::Start => true,
-            _ => false,
-        };
-
-        if start && self.units.masked(&name) {
-            return vec![res_err(format!("Unit {} is masked.", name))];
-        }
-        let conf = self.units.get(&name).cloned();
-        let utype = conf
-            .as_ref()
-            .map(|c| Some(c.unit_type))
-            .unwrap_or_else(|| unit_type_by_name(&name));
-        match utype {
-            Some(UnitType::Service) => {
-                vec![SmActionR::SendService(ServiceCmdUnit { name, conf, op })]
+    /// actor 主循环
+    pub async fn run(mut self) {
+        while let Some(m) = self.rx.recv().await {
+            match m {
+                M::M(UnitDM::SdReq(req, reply)) => {
+                    let (s1, actions) = self.sm.t(SmInput::SdReq(req));
+                    self.sm = s1;
+                    self.exec_actions_r(actions, reply).await;
+                }
+                M::M(UnitDM::StartDefaultTarget(reply)) => {
+                    let (s1, actions) = self.sm.t(SmInput::StartDefaultTarget);
+                    self.sm = s1;
+                    self.exec_actions_d(actions, reply).await;
+                }
+                M::M(UnitDM::Exit(reply)) => {
+                    let (s1, actions) = self.sm.t(SmInput::Exit);
+                    self.sm = s1;
+                    self.exec_actions_d(actions, reply).await;
+                }
+                M::ReloadOk(conf, me, reply) => {
+                    let (s1, actions) = self.sm.t(SmInput::ReloadOk(conf, me));
+                    self.sm = s1;
+                    self.exec_actions_r(actions, reply).await;
+                }
+                M::ReloadErr(e, reply) => {
+                    let (s1, actions) = self.sm.t(SmInput::ReloadErr(e));
+                    self.sm = s1;
+                    self.exec_actions_r(actions, reply).await;
+                }
+                M::WriteDbDone(result, pending, reply) => {
+                    let (s1, actions) = self.sm.t(SmInput::WriteDbDone(result, pending));
+                    self.sm = s1;
+                    self.exec_actions_r(actions, reply).await;
+                }
+                M::ExitServiceDone(result, reply) => {
+                    let (s1, actions) = self.sm.t(SmInput::ExitServiceDone(result));
+                    self.sm = s1;
+                    self.exec_actions_d(actions, reply).await;
+                }
             }
-            // 暂不支持
-            //UnitType::Timer => vec![SmActionR::SendTimer],
-            //UnitType::Target => TODO,
-            _ => vec![res_err(format!("cannot operate unit `{}`", name))],
+            if self.exit {
+                break;
+            }
+        }
+    }
+
+    /// 执行状态机输出的动作列表 (SdReq / reload / WriteDbDone 路径)
+    async fn exec_actions_r(&self, actions: Vec<SmOutput>, reply: oneshot::Sender<SdRes>) {
+        // reply 只能使用一次, 重复使用说明状态机输出有 BUG
+        let mut reply = Some(reply);
+
+        for a in actions {
+            let Some(a) = self.exec_action(a).await else {
+                continue;
+            };
+            match a {
+                SmOutput::Reply(resp) => {
+                    send_reply(reply.take().unwrap(), resp);
+                }
+                SmOutput::SendSelf(req) => {
+                    let t = reply.take().unwrap();
+                    if self.tx.send(M::M(UnitDM::SdReq(req, t))).await.is_err() {
+                        error!("send self command failed (UnitD stopped)");
+                    }
+                }
+                SmOutput::SendService(cmd) => {
+                    let t = reply.take().unwrap();
+                    if self.sd.send(ServiceDM::Unit(cmd, t)).await.is_err() {
+                        error!("send unit command to ServiceD failed (ServiceD stopped)");
+                    }
+                }
+                // 暂不支持 timer
+                // SmOutput::SendTimer => {}
+                SmOutput::QueryService(req) => {
+                    let t = reply.take().unwrap();
+                    spawn_query(req, self.sd.clone(), t);
+                }
+                SmOutput::WriteDb(write, pending) => {
+                    let t = reply.take().unwrap();
+                    spawn_write_db(self.db.clone(), self.tx.clone(), write, pending, t);
+                }
+                SmOutput::Reload => {
+                    let t = reply.take().unwrap();
+                    spawn_reload(self.db.clone(), self.conf_path.clone(), self.tx.clone(), t);
+                }
+                _ => unreachable!("unexpected UnitD action for SdRes reply"),
+            }
+        }
+    }
+
+    /// 执行状态机输出的动作列表 (StartDefaultTarget / Exit 路径)
+    async fn exec_actions_d(
+        &mut self,
+        actions: Vec<SmOutput>,
+        reply: oneshot::Sender<Result<(), SysdError>>,
+    ) {
+        // reply 只能使用一次, 重复使用说明状态机输出有 BUG
+        let mut reply = Some(reply);
+
+        for a in actions {
+            let Some(a) = self.exec_action(a).await else {
+                continue;
+            };
+            match a {
+                SmOutput::ReplyResult(resp) => {
+                    send_reply(reply.take().unwrap(), resp);
+                }
+                SmOutput::SendStartMany(services) => {
+                    let t = reply.take().unwrap();
+                    if self
+                        .sd
+                        .send(ServiceDM::StartMany(services, t))
+                        .await
+                        .is_err()
+                    {
+                        error!("send start-many to ServiceD failed (ServiceD stopped)");
+                    }
+                }
+                SmOutput::ExitService => {
+                    let t = reply.take().unwrap();
+                    spawn_exit_wait(self.sd.clone(), self.tx.clone(), t);
+                }
+                SmOutput::Exit => {
+                    self.exit = true;
+                }
+                _ => unreachable!("unexpected UnitD action for Result reply"),
+            }
+        }
+    }
+
+    /// 执行一个不依赖 reply 类型的动作.
+    ///
+    /// 支持则执行并返回 `None`; 不支持则原样返回, 由调用方处理.
+    async fn exec_action(&self, a: SmOutput) -> Option<SmOutput> {
+        match a {
+            SmOutput::Log { level, unit, msg } => {
+                self.logd.write_with(level, unit.as_deref(), &msg).unwrap();
+                None
+            }
+            o => Some(o),
         }
     }
 }
 
-/// 构造错误响应动作
-fn res_err(msg: impl Into<String>) -> SmActionR {
-    SmActionR::Reply(SdRes::Err(msg.into()))
+/// 向数据库写入 enable / mask 更新, 完成后通过内部事件回报.
+///
+/// 该 task 不执行其它逻辑; 后续步骤由状态机在收到 [`M::WriteDbDone`] 时决定.
+fn spawn_write_db(
+    db: DbClient,
+    self_tx: mpsc::Sender<M>,
+    write: WriteUnit,
+    pending: PendingWrite,
+    reply: oneshot::Sender<SdRes>,
+) {
+    tokio::spawn(async move {
+        let result = write_unit(&db, &write).await;
+        if self_tx
+            .send(M::WriteDbDone(result, pending, reply))
+            .await
+            .is_err()
+        {
+            error!("send write-db-done to UnitD actor failed (actor stopped)");
+        }
+    });
 }
 
-/// unit 未找到的错误消息
-fn not_found_msg(name: &str) -> String {
-    format!("Unit {} not found.", name)
-}
-
-/// 校验一个 unit 是否可 enable
-fn validate_enable(unit: &Unit, masked: bool) -> Result<(), String> {
-    if unit.install.wanted_by.as_deref() != Some(TARGET_DEFAULT) {
-        return Err(format!(
-            "unit `{}` cannot be enabled (unknown target `{:?}`)",
-            unit.name, unit.install.wanted_by,
-        ));
-    }
-    if masked {
-        return Err(format!("Unit {} is masked.", unit.name));
-    }
-    Ok(())
+/// 请求 ServiceD 停止所有 service, 并仅在收到响应后回报内部事件.
+///
+/// 该 task 不执行其它退出逻辑; 后续步骤由状态机在收到 [`M::ExitServiceDone`] 时决定.
+fn spawn_exit_wait(
+    sd: ServiceD,
+    self_tx: mpsc::Sender<M>,
+    reply: oneshot::Sender<Result<(), SysdError>>,
+) {
+    tokio::spawn(async move {
+        let (tx, rx) = oneshot::channel();
+        if sd.send(ServiceDM::Exit(tx)).await.is_err() {
+            error!("send exit to ServiceD failed (ServiceD stopped)");
+        }
+        let result = rx
+            .await
+            .unwrap_or_else(|_| Err(SysdError::Failed("ServiceD stopped".to_string())));
+        if self_tx
+            .send(M::ExitServiceDone(result, reply))
+            .await
+            .is_err()
+        {
+            error!("send exit-service-done to UnitD actor failed (actor stopped)");
+        }
+    });
 }

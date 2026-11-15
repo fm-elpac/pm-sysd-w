@@ -22,6 +22,9 @@ use crate::{
 
 use super::{SysD, SysDM, SysdError};
 
+#[cfg(test)]
+mod test;
+
 /// 最大并发连接数 (同时最多接受的 ctl/log 连接).
 const MAX_CONNECTIONS: usize = 200;
 
@@ -80,12 +83,13 @@ pub async fn run(instance: Instance, conf_path: String) -> Result<Shutdown, Sysd
 
     // (3) 打开数据库.
     let db = DbClient::open(&conf.db_path).map_err(|e| SysdError::Msg(e.to_string()))?;
+    let vacuum_db = db.clone();
 
     // (4) 其余后续处理.
     let logd = Logd::new(db.clone());
 
     // 退出信号: SysD 决定退出时 通过 exit_tx 通知主循环.
-    let (exit_tx, mut exit_rx) = mpsc::channel::<Shutdown>(1);
+    let (exit_tx, mut exit_rx) = oneshot::channel::<Shutdown>();
     let sysd = SysD::spawn(db, logd.clone(), &conf_path, conf.units, exit_tx);
     for w in &conf.warnings {
         warn!("{}", w);
@@ -93,7 +97,9 @@ pub async fn run(instance: Instance, conf_path: String) -> Result<Shutdown, Sysd
     }
 
     let (tx, rx) = oneshot::channel();
-    sysd.send(SysDM::StartDefaultTarget(tx)).await.unwrap();
+    if sysd.send(SysDM::StartDefaultTarget(tx)).await.is_err() {
+        error!("send start-default-target failed (sysd stopped)");
+    }
     tokio::spawn(async move {
         if let Ok(Err(e)) = rx.await {
             error!("start default target: {}", e);
@@ -112,17 +118,24 @@ pub async fn run(instance: Instance, conf_path: String) -> Result<Shutdown, Sysd
     let shutdown;
     loop {
         tokio::select! {
-            r = exit_rx.recv() => {
+            r = &mut exit_rx => {
                 shutdown = r.unwrap_or(Shutdown::Exit);
                 break;
             }
             _ = sig_rx.recv() => {
                 // 外部信号: 交给 SysD 统一处理 (发送 exit 命令)
                 let (tx, rx) = oneshot::channel();
-                sysd.send(SysDM::SdReq((SdReq::SysD(SdReqSysd::Exit), tx)))
+                if sysd
+                    .send(SysDM::SdReq(SdReq::SysD(SdReqSysd::Exit), tx))
                     .await
-                    .unwrap();
-                rx.await.unwrap();
+                    .is_err()
+                {
+                    error!("send exit signal to sysd failed (sysd stopped)");
+                    continue;
+                }
+                if rx.await.is_err() {
+                    error!("exit signal: sysd stopped before reply");
+                }
             }
             accepted = listener.accept() => {
                 handle_accept(accepted, false, sysd.clone(), &sem);
@@ -136,7 +149,13 @@ pub async fn run(instance: Instance, conf_path: String) -> Result<Shutdown, Sysd
     // 优雅退出: 记录日志, 等待日志落库 (service 已由 SysD 通过 Exit 停止).
     logd.write_with("info", None, "pm-sysd-init exiting")
         .expect("write exit log");
-    logd.flush().expect("flush logs");
+    if let Err(e) = logd.flush().await {
+        error!("flush logs: {}", e);
+    }
+    // 退出前 (soft-reboot 重启自身前) 对数据库执行 vacuum.
+    if let Err(e) = vacuum_db.vacuum().await {
+        error!("vacuum database: {}", e);
+    }
     Ok(shutdown)
 }
 
@@ -192,7 +211,9 @@ async fn handle_conn(conn: SysdServerConn, sysd: SysD, ro: bool) {
     if let Err(e) = check_version(&hello) {
         error!("handshake version: {}", e);
         if let Ok(line) = encode_hello(&Hello::new()) {
-            conn.send(line).await.expect("send handshake version");
+            if let Err(e) = conn.send(line).await {
+                error!("send handshake version: {}", e);
+            }
         }
         return;
     }
@@ -230,18 +251,26 @@ async fn handle_conn(conn: SysdServerConn, sysd: SysD, ro: bool) {
         };
 
         // 只读连接只能只读查询, 不能修改.
-        if ro && !is_readonly(&cmd) {
+        if ro && !cmd.is_readonly() {
             error!("read-only connection attempted a modifying command");
             if let Ok(line) = encode_frame(&SdRes::Err("read-only connection".to_string())) {
-                conn.send(line)
-                    .await
-                    .expect("send read-only error response");
+                if let Err(e) = conn.send(line).await {
+                    error!("send read-only error response: {}", e);
+                }
             }
             return;
         }
 
         let (tx, rx) = oneshot::channel();
-        sysd.send(SysDM::SdReq((cmd, tx))).await.unwrap();
+        if sysd.send(SysDM::SdReq(cmd, tx)).await.is_err() {
+            error!("send command to sysd failed (sysd stopped)");
+            if let Ok(line) = encode_frame(&SdRes::Err("sysd stopped".to_string())) {
+                if let Err(e) = conn.send(line).await {
+                    error!("send sysd-stopped error response: {}", e);
+                }
+            }
+            return;
+        }
 
         let resp = rx
             .await
@@ -259,11 +288,6 @@ async fn handle_conn(conn: SysdServerConn, sysd: SysD, ro: bool) {
             }
         }
     }
-}
-
-/// 判断命令是否 只读 (允许从只读连接发出)
-fn is_readonly(cmd: &SdReq) -> bool {
-    matches!(cmd, SdReq::LogRO(_) | SdReq::UnitdRO(_) | SdReq::UnitRO(_))
 }
 
 /// 等待只读监听器的下一个连接; 无只读监听器时永远 pending.

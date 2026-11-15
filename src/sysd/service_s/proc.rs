@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::{
     conf::Unit,
@@ -11,13 +11,13 @@ use crate::{
 };
 
 use super::super::SysdError;
-use super::Ev;
-use super::actor::ExitInfo;
+use super::actor::M;
+use super::sm::ExitInfo;
 
 /// ServiceS 与子进程之间的控制消息
 pub enum WatcherCmd {
-    /// 终止子进程 (携带退出信息回执)
-    Kill(oneshot::Sender<ExitInfo>),
+    /// 终止子进程
+    Kill,
 }
 
 /// 启动一个 subprocess, 并接管其 stdout/stderr 写入 unit 日志.
@@ -139,64 +139,52 @@ fn exit_info(r: Result<std::process::ExitStatus, PaError>) -> ExitInfo {
 
 /// 启动子进程退出监视 (事件驱动, 不轮询).
 ///
-/// 持有子进程, 等待其自然退出; 收到终止命令时终止并等待退出.
+/// 持有子进程, 等待其自然退出; 收到终止命令时终止并等待退出. 无论自然退出还是
+/// 被终止, 都通过 `tx` 发送一次 [`M::ChildExited`].
 pub fn spawn_watcher(
     mut child: Process,
-    natural_tx: mpsc::Sender<ExitInfo>,
+    tx: mpsc::Sender<M>,
     mut kill_rx: mpsc::Receiver<WatcherCmd>,
 ) {
     tokio::spawn(async move {
-        let mut natural_status: Option<ExitInfo> = None;
-        let mut pending_kill: Option<oneshot::Sender<ExitInfo>> = None;
+        enum Next {
+            Exited(ExitInfo),
+            Kill,
+            Stop,
+        }
 
         loop {
-            {
+            // 在独立作用域中等待, 确保 `exit` future 在 kill 分支前释放.
+            let next = {
                 let exit = child.wait();
                 tokio::pin!(exit);
                 tokio::select! {
-                    s = exit => {
-                        natural_status = Some(exit_info(s));
+                    s = exit => Next::Exited(exit_info(s)),
+                    cmd = kill_rx.recv() => match cmd {
+                        Some(WatcherCmd::Kill) => Next::Kill,
+                        None => Next::Stop,
+                    },
+                }
+            };
+
+            match next {
+                Next::Exited(info) => {
+                    if tx.send(M::ChildExited(info)).await.is_err() {
+                        log::error!("child exit channel closed (ServiceS stopped)");
                     }
-                    cmd = kill_rx.recv() => {
-                        match cmd {
-                            Some(WatcherCmd::Kill(reply)) => pending_kill = Some(reply),
-                            None => return,
-                        }
+                    return;
+                }
+                Next::Kill => {
+                    if let Err(e) = child.kill().await {
+                        log::error!("kill child failed: {}", e);
                     }
+                    let s = child.wait().await;
+                    if tx.send(M::ChildExited(exit_info(s))).await.is_err() {
+                        log::error!("child exit channel closed (ServiceS stopped)");
+                    }
+                    return;
                 }
-            }
-
-            if let Some(info) = natural_status {
-                natural_tx
-                    .send(info)
-                    .await
-                    .expect("natural exit channel closed");
-                if let Some(reply) = pending_kill.take() {
-                    reply.send(info).expect("kill reply channel closed");
-                }
-                while let Some(cmd) = kill_rx.recv().await {
-                    let WatcherCmd::Kill(reply) = cmd;
-                    reply.send(info).expect("kill reply channel closed");
-                }
-                return;
-            }
-
-            if let Some(reply) = pending_kill.take() {
-                child.kill().await.expect("kill child");
-                let s = child.wait().await;
-                reply.send(exit_info(s)).expect("kill reply channel closed");
-                return;
-            }
-        }
-    });
-}
-
-/// 把自然退出事件转发到 ServiceS 的内部事件通道
-pub fn spawn_forwarder(mut natural_rx: mpsc::Receiver<ExitInfo>, ev_tx: mpsc::Sender<Ev>) {
-    tokio::spawn(async move {
-        while let Some(info) = natural_rx.recv().await {
-            if ev_tx.send(Ev::ChildExited(info)).await.is_err() {
-                break;
+                Next::Stop => return,
             }
         }
     });

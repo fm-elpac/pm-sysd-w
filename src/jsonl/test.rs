@@ -9,7 +9,7 @@ use super::{
     decode_frame, decode_hello, encode_frame, encode_hello,
 };
 
-use crate::sysd::{ServiceSta, UnitSta, UnitSubSta};
+use crate::sysd::{EnableSta, LoadSta, ServiceSta, UnitSta, UnitSubSta};
 
 /// 构造一个 最小可用的 service unit 配置 (供响应 roundtrip 使用).
 fn test_unit() -> Unit {
@@ -83,14 +83,25 @@ fn hello_json_shape() {
 fn check_version_protocol_mismatch() {
     let mut h = Hello::new();
     h.protocol = 2;
-    assert!(check_version(&h).is_err());
+    let e = check_version(&h).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "protocol version mismatch: local `1`, remote `2`"
+    );
 }
 
 #[test]
 fn check_version_software_mismatch() {
     let mut h = Hello::new();
     h.data.version = "0.0.0".into();
-    assert!(check_version(&h).is_err());
+    let e = check_version(&h).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "software version mismatch: local `{}`, remote `0.0.0`",
+            VERSION
+        )
+    );
 }
 
 #[test]
@@ -106,9 +117,16 @@ fn command_roundtrip() {
         SdReq::UnitdRO(SdReqUnitdRO::ListUnits),
         SdReq::UnitdRO(SdReqUnitdRO::ListTimers),
         SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
+            level: None,
             unit: Some("a.service".into()),
             limit: 100,
             cursor: None,
+        })),
+        SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
+            level: Some("error".into()),
+            unit: Some("a.service".into()),
+            limit: 10,
+            cursor: Some(7),
         })),
         SdReq::UnitRO(unit_ro("a.service", SdReqUnitOpRO::UnitState)),
         SdReq::UnitRO(unit_ro("a.service", SdReqUnitOpRO::Status)),
@@ -129,7 +147,8 @@ fn command_roundtrip() {
         SdReq::Unit(unit("a.service", SdReqUnitOp::Disable { now: false })),
         SdReq::Unit(unit("a.service", SdReqUnitOp::Reenable)),
         SdReq::Unit(unit("a.service", SdReqUnitOp::Preset)),
-        SdReq::Unit(unit("a.service", SdReqUnitOp::Mask)),
+        SdReq::Unit(unit("a.service", SdReqUnitOp::Mask { now: false })),
+        SdReq::Unit(unit("a.service", SdReqUnitOp::Mask { now: true })),
         SdReq::Unit(unit("a.service", SdReqUnitOp::Unmask)),
         SdReq::UnitdRO(SdReqUnitdRO::GetDefault),
         SdReq::UnitD(SdReqUnitd::SetDefault {
@@ -141,6 +160,7 @@ fn command_roundtrip() {
         SdReq::UnitD(SdReqUnitd::DaemonReload),
         SdReq::SysD(SdReqSysd::SoftReboot),
         SdReq::SysD(SdReqSysd::Exit),
+        SdReq::SysD(SdReqSysd::SqliteVacuum),
     ];
 
     for cmd in cases {
@@ -153,7 +173,8 @@ fn command_roundtrip() {
 #[test]
 fn response_roundtrip() {
     let cases = vec![
-        SdRes::Ok,
+        SdRes::Ok(None),
+        SdRes::Ok(Some("warning".into())),
         SdRes::Err("boom".into()),
         SdRes::UnitState(Some(SdResUnitState {
             name: "a.service".into(),
@@ -161,8 +182,8 @@ fn response_roundtrip() {
             unit_type: UnitType::Service,
             active: UnitSta::Active,
             sub: UnitSubSta::Service(ServiceSta::Running),
-            enabled: false,
-            masked: false,
+            load: LoadSta::Loaded,
+            enable: EnableSta::Static,
         })),
         SdRes::ListUnits(vec![SdResUnitState {
             name: "a.service".into(),
@@ -170,17 +191,17 @@ fn response_roundtrip() {
             unit_type: UnitType::Service,
             active: UnitSta::Active,
             sub: UnitSubSta::Service(ServiceSta::Running),
-            enabled: false,
-            masked: false,
+            load: LoadSta::Loaded,
+            enable: EnableSta::Static,
         }]),
         SdRes::Status(SdResUnitStatus {
             name: "a.service".into(),
             description: "d".into(),
-            enabled: true,
-            masked: false,
+            load: LoadSta::Loaded,
+            enable: EnableSta::Enabled,
             active: UnitSta::Active,
+            sub: UnitSubSta::Service(ServiceSta::Running),
             s: SdResUnitS::Service(SdResServiceStatus {
-                sub: ServiceSta::Running,
                 pid: Some(42),
                 restart_count: 0,
                 exit_status: None,

@@ -167,8 +167,23 @@ fn build_command_unknown() {
 
 #[test]
 fn build_command_now_invalid() {
-    // `--now` 只对 enable/disable 有效.
+    // `--now` 只对 enable/disable/mask 有效.
     assert!(build_command("start", &s(&["a.service"]), true).is_err());
+}
+
+#[test]
+fn build_command_mask_now() {
+    let c = build_command("mask", &s(&["a.service"]), true).unwrap();
+    assert!(matches!(
+        c,
+        SdReq::Unit(SdReqUnit { name, op: SdReqUnitOp::Mask { now: true } }) if name == "a.service"
+    ));
+
+    let c = build_command("mask", &s(&["a.service"]), false).unwrap();
+    assert!(matches!(
+        c,
+        SdReq::Unit(SdReqUnit { name, op: SdReqUnitOp::Mask { now: false } }) if name == "a.service"
+    ));
 }
 
 #[test]
@@ -235,6 +250,7 @@ fn build_command_no_arg_commands() {
         "daemon-reload",
         "soft-reboot",
         "exit",
+        "sqlite-vacuum",
     ];
     for c in cmds {
         assert!(

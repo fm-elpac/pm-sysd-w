@@ -154,19 +154,41 @@ import-environment
 daemon-reload
 soft-reboot
 exit
+
+# pm-sysd-w 自己添加的命令
+sqlite-vacuum
 ```
 
 `enable` / `disable` 支持 `--now` (例如 `enable --now`).
+
+`mask` 行为 (与 systemd 保持一致):
+
+- `mask` 支持 `--now`; 默认只 mask, 不停止正在运行的 unit, 加 `--now` 才停止.
+- 对配置文件中不存在的 unit 执行 `mask`, 会输出警告, 但操作仍然成功.
+- 被 `mask` 的 unit 视为不存在: 不出现在 `list-units`, 也不显示配置详情 (`show`
+  / `cat` / `list-dependencies` 会报 unit 不存在).
+- 对被 `mask` 的 unit 执行 `status`, 返回该 unit 信息并显示 `masked`; 如果
+  service 仍在运行, 其余状态 (active / pid 等) 来自运行中的旧配置.
+- `start` / `restart` / `reload-or-restart` / `try-restart` /
+  `try-reload-or-restart` 对被 `mask` 的 unit 会报错, 阻止启动.
 
 命令行为说明:
 
 - unit 名称未写后缀时, 自动补 `.service` (例如 `status test` 等价于
   `status test.service`); `pm-sysd-log` 的 `-u` / `--unit` 同理.
 - `cat` 输出 pretty JSON (不模仿 systemd 的 unit 文件格式).
+- `list-units` / `status` / `list-timers` 的输出格式与列对齐尽量模仿 systemctl;
+  与本项目无关的字段会被省略 (详见源码 `src/cli/ctl/` 模块注释).
 - `is-active` 退出码: `0` active, `3` 非 active (inactive/failed), `4` 未知.
 - `is-failed` 退出码: `0` failed, `1` 非 failed, `4` 未知.
-- `is-enabled` 退出码: `0` enabled, `1` disabled/masked, `4` 未知.
+- `is-enabled` 退出码 (模仿 systemd): `0`
+  enabled/enabled-runtime/alias/static/indirect/generated/transient, `1`
+  linked/linked-runtime/masked/masked-runtime/disabled/bad, `4` 未知
+  (not-found).
 - `set-default` 初版仅支持 `default.target`; 其它值报错.
+- `daemon-reload` 会重新读取配置文件, 并从 sqlite 数据库重新读取 enable/mask
+  状态; reload 期间执行 `enable` / `disable` / `reenable` / `mask` / `unmask`
+  会报错, 且不允许并发执行多个 `daemon-reload` (后续请求报错).
 - `list-dependencies` 因 unit 间依赖功能尚未实现, 返回空结果.
 
 通用选项:
@@ -217,3 +239,4 @@ pm-sysd-log --machine=dev -eu test-run.service
 - `pm-sysd-ctl ... soft-reboot` 重启 pm-sysd-init 自身及所有被管理 service (不是
   Windows 重启).
 - 外部信号: Linux 上 SIGTERM, Windows 上 Ctrl+C, 也会触发优雅退出.
+- 退出前 (soft-reboot 重启自身前), pm-sysd-init 会对数据库执行一次 vacuum.

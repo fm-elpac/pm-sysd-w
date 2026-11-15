@@ -1,8 +1,14 @@
 //! pa 模块测试.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use super::{Instance, IpcAcl, PaError, SysdClient, SysdServer, choose_transport, resolve_path};
+use tokio::io::{AsyncWriteExt, BufReader, duplex};
+
+use super::{
+    Instance, IpcAcl, PaError, RECV_TIMEOUT, SysdClient, SysdServer, choose_transport, recv_line,
+    resolve_path,
+};
 
 #[test]
 fn instance_machine_name() {
@@ -83,4 +89,34 @@ async fn sysd_server_client_roundtrip() {
 
     conn.send("yo".to_string()).await.unwrap();
     assert_eq!(client.recv().await.unwrap(), "yo");
+}
+
+/// 对方完全没发消息时, `recv_line` 不应因 RECV_TIMEOUT 超时, 而是一直等待.
+#[tokio::test(start_paused = true)]
+async fn recv_line_waits_without_message() {
+    let (local, _remote) = duplex(64);
+    let mut reader = BufReader::new(local);
+    let handle = tokio::spawn(async move { recv_line(&mut reader).await });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    assert!(!handle.is_finished());
+    handle.abort();
+}
+
+/// 收到消息第一个字节后, 剩余部分若迟迟不到, 应在 RECV_TIMEOUT 内超时.
+#[tokio::test(start_paused = true)]
+async fn recv_line_times_out_after_first_byte() {
+    let (mut local, remote) = duplex(64);
+    local.write_all(b"partial").await.unwrap();
+    let mut reader = BufReader::new(remote);
+
+    let handle = tokio::spawn(async move { recv_line(&mut reader).await });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(RECV_TIMEOUT + Duration::from_millis(10)).await;
+
+    let r = handle.await.unwrap();
+    assert!(matches!(r, Err(PaError::Timeout(_))));
 }

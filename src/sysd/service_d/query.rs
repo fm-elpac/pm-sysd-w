@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 use crate::sysd::{ServiceSta, UnitSta};
 
+use super::super::send_reply;
 use super::super::service_s::{ServiceS, ServiceSM, ServiceStatus};
 use super::StatusInfo;
 
@@ -26,13 +27,11 @@ pub fn spawn_query_state(
                 } else {
                     rx.await.unwrap_or((UnitSta::Inactive, ServiceSta::Dead))
                 };
-                reply.send(state).expect("query-state reply channel closed");
+                send_reply(reply, state);
             });
         }
         None => {
-            reply
-                .send(active_sub_of(last.as_ref()))
-                .expect("query-state reply channel closed");
+            send_reply(reply, active_sub_of(last.as_ref()));
         }
     }
 }
@@ -54,28 +53,30 @@ pub fn spawn_query_status(
                         rx.await
                             .unwrap_or((UnitSta::Inactive, ServiceSta::Dead, None, 0, None))
                     };
-                reply
-                    .send(StatusInfo {
+                send_reply(
+                    reply,
+                    StatusInfo {
                         active,
                         sub,
                         pid,
                         restart_count,
                         exit_status,
-                    })
-                    .expect("query-status reply channel closed");
+                    },
+                );
             });
         }
         None => {
             let (active, sub, pid, restart_count, exit_status) = status_info_of(last.as_ref());
-            reply
-                .send(StatusInfo {
+            send_reply(
+                reply,
+                StatusInfo {
                     active,
                     sub,
                     pid,
                     restart_count,
                     exit_status,
-                })
-                .expect("query-status reply channel closed");
+                },
+            );
         }
     }
 }
@@ -101,7 +102,7 @@ pub fn spawn_query_states(
             };
             out.push((name, active, sub));
         }
-        reply.send(out).expect("query-states reply channel closed");
+        send_reply(reply, out);
     });
 }
 
