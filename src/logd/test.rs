@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{db::DbClient, test::TempDir};
+use crate::{db::DbClient, jsonl::SdReqPagePos, test::TempDir};
 
 use super::{Logd, proc::read_log_chunk, split_msg, warn::RateLimitState};
 
@@ -21,13 +21,16 @@ async fn write_and_page_entries() {
     logd.write_with("error", Some("a.service"), "boom").unwrap();
     logd.flush().await.unwrap();
 
-    let all = logd.page_entries(None, None, 10, None).await.unwrap();
+    let all = logd
+        .page_entries(None, None, true, SdReqPagePos::Start(0), 10)
+        .await
+        .unwrap();
     assert_eq!(all.total, 2);
     assert_eq!(all.entries.len(), 2);
     assert!(all.entries.iter().any(|e| e.msg == "hello"));
 
     let one = logd
-        .page_entries(None, Some("a.service"), 10, None)
+        .page_entries(None, Some("a.service"), true, SdReqPagePos::Start(0), 10)
         .await
         .unwrap();
     assert_eq!(one.total, 1);
@@ -37,7 +40,7 @@ async fn write_and_page_entries() {
     assert_eq!(one.entries[0].msg, "boom");
 
     let err = logd
-        .page_entries(Some("error"), None, 10, None)
+        .page_entries(Some("error"), None, true, SdReqPagePos::Start(0), 10)
         .await
         .unwrap();
     assert_eq!(err.total, 1);
@@ -94,27 +97,160 @@ async fn page_entries_pagination() {
     }
     logd.flush().await.unwrap();
 
-    // 第一页: 最新 2 条.
-    let p1 = logd.page_entries(None, None, 2, None).await.unwrap();
+    // 第一页: 从最旧开始, 升序取 2 条.
+    let p1 = logd
+        .page_entries(None, None, true, SdReqPagePos::Start(0), 2)
+        .await
+        .unwrap();
     assert_eq!(p1.total, 5);
     assert_eq!(p1.entries.len(), 2);
-    assert_eq!(p1.entries[0].msg, "m3");
-    assert_eq!(p1.entries[1].msg, "m4");
+    assert_eq!(p1.entries[0].msg, "m0");
+    assert_eq!(p1.entries[1].msg, "m1");
     let c1 = p1.cursor.expect("next cursor");
 
-    // 第二页: 继续读取.
-    let p2 = logd.page_entries(None, None, 2, Some(c1)).await.unwrap();
+    // 第二页: 从游标继续升序读取.
+    let p2 = logd
+        .page_entries(None, None, true, SdReqPagePos::Cursor(c1), 2)
+        .await
+        .unwrap();
     assert_eq!(p2.total, 5);
     assert_eq!(p2.entries.len(), 2);
-    assert_eq!(p2.entries[0].msg, "m1");
-    assert_eq!(p2.entries[1].msg, "m2");
+    assert_eq!(p2.entries[0].msg, "m2");
+    assert_eq!(p2.entries[1].msg, "m3");
     let c2 = p2.cursor.expect("next cursor");
 
     // 第三页: 最后 1 条, 无下一页.
-    let p3 = logd.page_entries(None, None, 2, Some(c2)).await.unwrap();
+    let p3 = logd
+        .page_entries(None, None, true, SdReqPagePos::Cursor(c2), 2)
+        .await
+        .unwrap();
     assert_eq!(p3.entries.len(), 1);
-    assert_eq!(p3.entries[0].msg, "m0");
+    assert_eq!(p3.entries[0].msg, "m4");
     assert_eq!(p3.cursor, None);
+}
+
+#[tokio::test]
+async fn page_entries_end_asc_position() {
+    let dir = TempDir::new("logd");
+    let path = tmp_db(&dir);
+    let db = DbClient::open(&path).unwrap();
+    let logd = Logd::new(db);
+
+    for i in 0..5 {
+        logd.write_with("info", None, &format!("m{}", i)).unwrap();
+    }
+    logd.flush().await.unwrap();
+
+    // End(2) + asc=true: 从最新向前跳过 2 条 (即第 3 条最新) 开始, 升序返回
+    // 剩余的 3 条.
+    let page = logd
+        .page_entries(None, None, true, SdReqPagePos::End(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 5);
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].msg, "m2");
+    assert_eq!(page.entries[1].msg, "m3");
+    assert_eq!(page.entries[2].msg, "m4");
+    assert_eq!(page.cursor, None);
+}
+
+#[tokio::test]
+async fn page_entries_end_asc_skip_larger_than_total() {
+    let dir = TempDir::new("logd");
+    let path = tmp_db(&dir);
+    let db = DbClient::open(&path).unwrap();
+    let logd = Logd::new(db);
+
+    for i in 0..3 {
+        logd.write_with("info", None, &format!("m{}", i)).unwrap();
+    }
+    logd.flush().await.unwrap();
+
+    // End(1000) + asc=true: 跳过条数超过已有条数, 从最旧数据开始, 升序返回全部.
+    let page = logd
+        .page_entries(None, None, true, SdReqPagePos::End(1000), 1000)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 3);
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].msg, "m0");
+    assert_eq!(page.entries[2].msg, "m2");
+    assert_eq!(page.cursor, None);
+}
+
+#[tokio::test]
+async fn page_entries_start_asc_position() {
+    let dir = TempDir::new("logd");
+    let path = tmp_db(&dir);
+    let db = DbClient::open(&path).unwrap();
+    let logd = Logd::new(db);
+
+    for i in 0..5 {
+        logd.write_with("info", None, &format!("m{}", i)).unwrap();
+    }
+    logd.flush().await.unwrap();
+
+    // Start(2) + asc=true: 跳过最旧 2 条, 升序返回 m2..m4.
+    let page = logd
+        .page_entries(None, None, true, SdReqPagePos::Start(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 5);
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].msg, "m2");
+    assert_eq!(page.entries[2].msg, "m4");
+    assert_eq!(page.cursor, None);
+}
+
+#[tokio::test]
+async fn page_entries_start_desc_position() {
+    let dir = TempDir::new("logd");
+    let path = tmp_db(&dir);
+    let db = DbClient::open(&path).unwrap();
+    let logd = Logd::new(db);
+
+    for i in 0..5 {
+        logd.write_with("info", None, &format!("m{}", i)).unwrap();
+    }
+    logd.flush().await.unwrap();
+
+    // Start(2) + asc=false: 从第 3 条最旧数据开始, 降序返回 m2,m1,m0.
+    let page = logd
+        .page_entries(None, None, false, SdReqPagePos::Start(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 5);
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].msg, "m2");
+    assert_eq!(page.entries[1].msg, "m1");
+    assert_eq!(page.entries[2].msg, "m0");
+    assert_eq!(page.cursor, None);
+}
+
+#[tokio::test]
+async fn page_entries_end_desc() {
+    let dir = TempDir::new("logd");
+    let path = tmp_db(&dir);
+    let db = DbClient::open(&path).unwrap();
+    let logd = Logd::new(db);
+
+    for i in 0..5 {
+        logd.write_with("info", None, &format!("m{}", i)).unwrap();
+    }
+    logd.flush().await.unwrap();
+
+    // End(0) + asc=false: 从最新开始降序, 一页 3 条.
+    let page = logd
+        .page_entries(None, None, false, SdReqPagePos::End(0), 3)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 5);
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].msg, "m4");
+    assert_eq!(page.entries[1].msg, "m3");
+    assert_eq!(page.entries[2].msg, "m2");
+    assert!(page.cursor.is_some());
 }
 
 #[test]

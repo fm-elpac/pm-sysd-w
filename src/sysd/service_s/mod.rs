@@ -8,8 +8,5 @@ mod actor;
 mod proc;
 mod sm;
 
-#[cfg(test)]
-mod test;
-
 pub use actor::{ServiceS, ServiceSM};
-pub use sm::ServiceStatus;
+pub use sm::{ServiceStatus, ServiceStatusInfo};

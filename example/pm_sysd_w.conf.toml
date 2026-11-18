@@ -24,6 +24,5 @@ pm_tc = 1
 "env:Unit" = "hello.service"
 "env:Unit.Description" = "Say hello"
 
+"env:Service.Type" = "oneshot"
 "env:Service.ExecStart" = "path/to/hello.exe"
-
-"env:Install.WantedBy" = "default.target"

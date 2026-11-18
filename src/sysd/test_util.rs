@@ -6,16 +6,17 @@ use tokio::sync::oneshot;
 
 use crate::{
     conf,
-    db::DbClient,
     jsonl::{
-        SdReq, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdRes,
-        SdResServiceStatus, SdResUnitS, SdResUnitState, SdResUnitStatus,
+        SdReq, SdReqPagePos, SdReqUnit, SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO,
+        SdReqUnitd, SdReqUnitdRO, SdRes, SdResServiceStatus, SdResUnitS, SdResUnitState,
+        SdResUnitStatus,
     },
     logd::Logd,
+    sysu::{EnableSta, LoadSta, UnitSta},
     test::TempDir,
 };
 
-use super::{EnableSta, LoadSta, SysD, SysDM, SysdError, UnitSta, init::Shutdown};
+use super::{SysD, SysDM, SysdError, init::Shutdown, reload::ReloadR};
 
 /// 一个 立即成功退出 (退出码 0) 的 命令 (跨平台).
 pub fn ok_cmd() -> String {
@@ -122,11 +123,45 @@ pub fn make_sysd_with_exit(text: &str) -> (SysD, Logd, TempDir, oneshot::Receive
     std::fs::write(&conf_path, text).unwrap();
     let conf_path = conf_path.to_string_lossy().into_owned();
 
-    let conf = conf::load_conf(&conf_path).unwrap();
-    let db = DbClient::open(&conf.db_path).unwrap();
+    // 在独立线程的 runtime 中执行异步加载 (测试辅助, 不经过生产 subprocess 路径).
+    let load_path = conf_path.clone();
+    let (load, db) = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let conf =
+                crate::conf::load_conf(&load_path).map_err(|e| SysdError::Failed(e.to_string()))?;
+            let db = crate::db::DbClient::open(&conf.db_path)
+                .map_err(|e| SysdError::Failed(e.to_string()))?;
+            let rows = db
+                .unit_list_all()
+                .await
+                .map_err(|e| SysdError::Failed(e.to_string()))?;
+
+            let mut masked = std::collections::HashSet::new();
+            let mut enabled = std::collections::HashSet::new();
+            for u in rows {
+                if u.masked {
+                    masked.insert(u.name.clone());
+                }
+                if u.enabled {
+                    enabled.insert(u.name);
+                }
+            }
+
+            let me = super::unit_d::UnitSME { masked, enabled };
+            Ok::<_, SysdError>((ReloadR { conf, me }, db))
+        })
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+
     let logd = Logd::new(db.clone());
     let (exit_tx, exit_rx) = oneshot::channel::<Shutdown>();
-    let sysd = SysD::spawn(db, logd.clone(), &conf_path, conf.units, exit_tx);
+    let sysd = SysD::spawn(db, logd.clone(), &conf_path, load, exit_tx);
     (sysd, logd, dir, exit_rx)
 }
 
@@ -227,6 +262,10 @@ pub async fn unit_unmask(sysd: &SysD, name: &str) -> Result<(), SysdError> {
     ok(handle(sysd, &SdReq::Unit(unit(name, SdReqUnitOp::Unmask))).await)
 }
 
+pub async fn unit_preset(sysd: &SysD, name: &str) -> Result<(), SysdError> {
+    ok(handle(sysd, &SdReq::Unit(unit(name, SdReqUnitOp::Preset))).await)
+}
+
 pub async fn daemon_reload(sysd: &SysD) -> Result<(), SysdError> {
     ok(handle(sysd, &SdReq::UnitD(SdReqUnitd::DaemonReload)).await)
 }
@@ -252,9 +291,28 @@ pub async fn unit_state(sysd: &SysD, name: &str) -> Option<SdResUnitState> {
 }
 
 pub async fn list_units(sysd: &SysD) -> Vec<SdResUnitState> {
-    match handle(sysd, &SdReq::UnitdRO(SdReqUnitdRO::ListUnits)).await {
-        SdRes::ListUnits(units) => units,
-        other => panic!("unexpected response: {:?}", other),
+    let mut cursor: Option<String> = None;
+    let mut all = Vec::new();
+    loop {
+        let resp = handle(
+            sysd,
+            &SdReq::UnitdRO(SdReqUnitdRO::ListUnits(SdReqUnitList {
+                limit: u32::MAX,
+                cursor: cursor.clone(),
+            })),
+        )
+        .await;
+        match resp {
+            SdRes::ListUnits(page) => {
+                let count = page.list.len();
+                all.extend(page.list);
+                cursor = page.cursor;
+                if count == 0 || cursor.is_none() {
+                    return all;
+                }
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
     }
 }
 
@@ -281,7 +339,7 @@ pub async fn list_dependencies(sysd: &SysD, name: &str) -> Result<Vec<String>, S
     )
     .await
     {
-        SdRes::Dependencies(deps) => Ok(deps),
+        SdRes::Dependencies(page) => Ok(page.list),
         SdRes::Err(message) => Err(SysdError::Failed(message)),
         other => panic!("unexpected response: {:?}", other),
     }
@@ -342,7 +400,7 @@ pub async fn wait_stdout_stderr(logd: &Logd, unit: &str, out: &str, err: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let entries = logd
-            .page_entries(None, Some(unit), 200, None)
+            .page_entries(None, Some(unit), false, SdReqPagePos::End(0), 200)
             .await
             .unwrap()
             .entries;

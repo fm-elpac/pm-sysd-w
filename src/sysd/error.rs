@@ -2,8 +2,10 @@
 
 use std::{error::Error, fmt};
 
+use serde::Serialize;
+
 /// sysd 模块错误.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum SysdError {
     /// unit 未找到 / 未加载
     NotFound(String),

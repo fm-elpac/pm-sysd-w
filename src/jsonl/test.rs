@@ -3,13 +3,14 @@
 use crate::conf::{Install, RestartPolicy, Service, ServiceType, Unit, UnitType, Win};
 
 use super::{
-    Hello, PROTOCOL_VERSION, SdReq, SdReqLogQuery, SdReqLogRO, SdReqSysd, SdReqUnit, SdReqUnitOp,
-    SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdRes, SdResLogEntry, SdResServiceStatus,
-    SdResTimerInfo, SdResUnitS, SdResUnitState, SdResUnitStatus, VERSION, check_version,
-    decode_frame, decode_hello, encode_frame, encode_hello,
+    Hello, PROTOCOL_VERSION, SdReq, SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdReqPagePos,
+    SdReqSysd, SdReqUnit, SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd,
+    SdReqUnitdRO, SdRes, SdResLogItem, SdResPage, SdResServiceStatus, SdResTimerInfo, SdResUnitS,
+    SdResUnitState, SdResUnitStatus, VERSION, check_version, decode_frame, decode_hello,
+    encode_frame, encode_hello,
 };
 
-use crate::sysd::{EnableSta, LoadSta, ServiceSta, UnitSta, UnitSubSta};
+use crate::sysu::{EnableSta, LoadSta, ServiceSta, UnitSta, UnitSubSta};
 
 /// 构造一个 最小可用的 service unit 配置 (供响应 roundtrip 使用).
 fn test_unit() -> Unit {
@@ -21,9 +22,9 @@ fn test_unit() -> Unit {
         start_limit_burst: 5,
         service: Service {
             service_type: ServiceType::Simple,
-            exec_start: vec!["bin".to_string()],
-            exec_stop: None,
-            exec_reload: None,
+            exec_start: vec![vec!["bin".to_string()]],
+            exec_stop: Vec::new(),
+            exec_reload: Vec::new(),
             restart: RestartPolicy::No,
             restart_sec: 1,
             timeout_start_sec: 90,
@@ -32,7 +33,9 @@ fn test_unit() -> Unit {
             environment: Vec::new(),
             remain_after_exit: false,
         },
-        install: Install { wanted_by: None },
+        install: Install {
+            wanted_by: Vec::new(),
+        },
         win: Win {
             create_no_window: false,
         },
@@ -114,19 +117,32 @@ fn decode_invalid() {
 #[test]
 fn command_roundtrip() {
     let cases = vec![
-        SdReq::UnitdRO(SdReqUnitdRO::ListUnits),
-        SdReq::UnitdRO(SdReqUnitdRO::ListTimers),
-        SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
-            level: None,
-            unit: Some("a.service".into()),
+        SdReq::UnitdRO(SdReqUnitdRO::ListUnits(SdReqUnitList {
             limit: 100,
             cursor: None,
         })),
-        SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
-            level: Some("error".into()),
-            unit: Some("a.service".into()),
+        SdReq::UnitdRO(SdReqUnitdRO::ListUnits(SdReqUnitList {
             limit: 10,
-            cursor: Some(7),
+            cursor: Some("a.service".into()),
+        })),
+        SdReq::UnitdRO(SdReqUnitdRO::ListTimers),
+        SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
+            filter: SdReqLogQueryFilter {
+                level: None,
+                unit: Some("a.service".into()),
+            },
+            pos: SdReqPagePos::End(100),
+            asc: true,
+            limit: 100,
+        })),
+        SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
+            filter: SdReqLogQueryFilter {
+                level: Some("error".into()),
+                unit: Some("a.service".into()),
+            },
+            pos: SdReqPagePos::Cursor(7),
+            asc: false,
+            limit: 10,
         })),
         SdReq::UnitRO(unit_ro("a.service", SdReqUnitOpRO::UnitState)),
         SdReq::UnitRO(unit_ro("a.service", SdReqUnitOpRO::Status)),
@@ -185,15 +201,19 @@ fn response_roundtrip() {
             load: LoadSta::Loaded,
             enable: EnableSta::Static,
         })),
-        SdRes::ListUnits(vec![SdResUnitState {
-            name: "a.service".into(),
-            description: "d".into(),
-            unit_type: UnitType::Service,
-            active: UnitSta::Active,
-            sub: UnitSubSta::Service(ServiceSta::Running),
-            load: LoadSta::Loaded,
-            enable: EnableSta::Static,
-        }]),
+        SdRes::ListUnits(SdResPage {
+            total: 1,
+            cursor: None,
+            list: vec![SdResUnitState {
+                name: "a.service".into(),
+                description: "d".into(),
+                unit_type: UnitType::Service,
+                active: UnitSta::Active,
+                sub: UnitSubSta::Service(ServiceSta::Running),
+                load: LoadSta::Loaded,
+                enable: EnableSta::Static,
+            }],
+        }),
         SdRes::Status(SdResUnitStatus {
             name: "a.service".into(),
             description: "d".into(),
@@ -201,6 +221,7 @@ fn response_roundtrip() {
             enable: EnableSta::Enabled,
             active: UnitSta::Active,
             sub: UnitSubSta::Service(ServiceSta::Running),
+            since: Some(1_700_000_000_000),
             s: SdResUnitS::Service(SdResServiceStatus {
                 pid: Some(42),
                 restart_count: 0,
@@ -209,21 +230,29 @@ fn response_roundtrip() {
         }),
         SdRes::Config(test_unit()),
         SdRes::DefaultTarget("default.target".into()),
-        SdRes::Dependencies(vec!["default.target".into()]),
-        SdRes::Timers(vec![SdResTimerInfo {
-            name: "t.timer".into(),
-        }]),
-        SdRes::Logs {
+        SdRes::Dependencies(SdResPage {
             total: 1,
             cursor: None,
-            logs: vec![SdResLogEntry {
+            list: vec!["default.target".into()],
+        }),
+        SdRes::Timers(SdResPage {
+            total: 1,
+            cursor: None,
+            list: vec![SdResTimerInfo {
+                name: "t.timer".into(),
+            }],
+        }),
+        SdRes::Logs(SdResPage {
+            total: 1,
+            cursor: None,
+            list: vec![SdResLogItem {
                 id: 1,
                 ts: "2026-11-10T00:00:00.000Z".into(),
                 level: "info".into(),
                 unit: Some("a.service".into()),
                 msg: "m".into(),
             }],
-        },
+        }),
     ];
 
     for resp in cases {

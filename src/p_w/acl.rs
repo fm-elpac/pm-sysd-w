@@ -7,10 +7,9 @@
 //!   在命令层执行.
 //! - [`PipeAcl::CurrentUser`]: 仅当前用户.
 //!
-//! Windows 安全描述符 / ACL API 均为 `unsafe fn`, 本模块 是 p_w 中 允许
-//! `unsafe` 的两个模块之一 (另一个是 `console`): 以 `#[allow(unsafe_code)]`
-//! 覆盖 crate 级 `deny(unsafe_code)`, 并把 unsafe 调用集中在此处, 对外提供
-//! 安全接口.
+//! Windows 安全描述符 / ACL API 均为 `unsafe fn`,
+//! 本模块是 p_w 中允许 `unsafe` 的模块之一.
+//! 把 unsafe 调用集中在此处, 对外提供安全接口.
 #![allow(unsafe_code)]
 
 use std::{
@@ -43,25 +42,68 @@ use windows::{
 
 use super::PwError;
 
-/// 安全描述符 修订号 (固定).
+/// 安全描述符修订号 (固定)
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
-/// 命名管道 权限级别.
+/// 命名管道权限级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipeAcl {
-    /// 系统级主管道: 仅管理员 / SYSTEM.
+    /// 系统级主管道: 仅管理员 / SYSTEM
     System,
-    /// 系统级只读管道: 本机普通用户 可连接 (读+写), 只读限制由 init 命令层执行.
+    /// 系统级只读管道: 本机普通用户可连接 (读+写), 只读限制由 init 命令层执行
     SystemReadOnly,
-    /// 用户级 / 自定义实例: 仅当前用户.
+    /// 用户级 / 自定义实例: 仅当前用户
     CurrentUser,
 }
 
-/// 保持 安全描述符 / ACL 缓冲区 存活, 并提供 传递给 `CreateNamedPipeW` 的指针.
+/// 保持安全描述符 / ACL 缓冲区存活, 并提供传递给 `CreateNamedPipeW` 的指针
 struct SecurityAttributes {
     sa: SECURITY_ATTRIBUTES,
     _sd: Box<SECURITY_DESCRIPTOR>,
-    _acl: Vec<u8>,
+    _acl: AlignedBuffer,
+}
+
+/// 按 `usize` 对齐的字节缓冲区, 供 Win32 API 写入结构体
+struct AlignedBuffer {
+    data: Vec<usize>,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    fn new_zeroed(len: usize) -> Self {
+        Self {
+            data: vec![0usize; len.div_ceil(size_of::<usize>())],
+            len,
+        }
+    }
+
+    fn from_slice(bytes: &[u8]) -> Self {
+        let mut buf = Self::new_zeroed(bytes.len());
+        unsafe { buf.as_mut_ptr().copy_from(bytes.as_ptr(), bytes.len()) };
+        buf
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.data.as_ptr() as *const u8
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr() as *mut u8
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// 自动关闭 Win32 句柄
+struct HandleGuard(HANDLE);
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        // `Drop` 无法返回错误, 关闭句柄失败只能忽略
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }
 
 impl SecurityAttributes {
@@ -76,14 +118,14 @@ impl SecurityAttributes {
             ),
             PipeAcl::SystemReadOnly => (
                 vec![well_known_sid(WinAuthenticatedUserSid)?],
-                // 允许 普通用户 读+写 以完成 请求/响应 通信; 只读 由 init 命令层 限制.
+                // 允许普通用户读+写以完成请求/响应通信. 只读由 init 命令层限制.
                 vec![FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0],
             ),
             PipeAcl::CurrentUser => (vec![current_user_sid()?], vec![FILE_ALL_ACCESS.0]),
         };
 
-        // ACL 缓冲区 (足够容纳 少量 ACE).
-        let mut acl_buf = vec![0u8; 1024];
+        // ACL 缓冲区 (足够容纳少量 ACE)
+        let mut acl_buf = AlignedBuffer::new_zeroed(1024);
         let acl = acl_buf.as_mut_ptr() as *mut ACL;
 
         unsafe { InitializeAcl(acl, acl_buf.len() as u32, ACL_REVISION) }
@@ -121,23 +163,29 @@ impl SecurityAttributes {
     }
 }
 
-/// 创建 一个 命名管道 服务器 (带 DACL).
+/// 创建一个命名管道服务器 (带 DACL).
 ///
-/// `first` 为 true 时 使用 `first_pipe_instance` 做实例唯一性检测.
+/// `first` 为 true 时使用 `first_pipe_instance` 做实例唯一性检测.
 pub fn create_server(addr: &str, first: bool, acl: PipeAcl) -> Result<NamedPipeServer, PwError> {
     let sa = SecurityAttributes::new(acl)?;
     let mut opts = ServerOptions::new();
     opts.first_pipe_instance(first);
 
-    // 调用 tokio 的 raw 接口 传入 SECURITY_ATTRIBUTES; `sa` 在整个调用期间保持存活.
+    // 调用 tokio 的 raw 接口传入 SECURITY_ATTRIBUTES; `sa` 在整个调用期间保持存活.
     unsafe { opts.create_with_security_attributes_raw(addr, sa.as_ptr()) }
         .map_err(|e| PwError::Ipc(format!("create pipe `{}`: {}", addr, e)))
 }
 
-/// 检查 命名管道 是否存在 (不建立连接).
+/// 检查命名管道是否存在 (不建立连接).
 ///
-/// 使用 `WaitNamedPipeW` 超时 0: 仅当 返回 `ERROR_FILE_NOT_FOUND` 时 认为不存在;
-/// 其它错误 (例如 权限不足 / 管道暂时忙) 表示 管道存在.
+/// 使用 `WaitNamedPipeW` 超时 0: 仅当返回 `ERROR_FILE_NOT_FOUND` 时认为不存在;
+/// 其它错误 (例如权限不足 / 管道暂时忙) 表示管道存在.
+///
+/// 已知限制 (低严重度): 空名称 / `\\.\pipe\` 等非法地址可能返回
+/// `ERROR_BAD_PATHNAME` / `ERROR_INVALID_PARAMETER`, 因而被误判为存在.
+/// 本程序只把此函数作为连接前的快速失败检查, 正常实例名由 `Instance::name`
+/// 生成并带固定前缀; 即使异常自定义实例名触发误判, 后续 `connect` 仍会失败
+/// 并返回错误, 因此在本程序的使用场景下不会导致问题.
 pub fn pipe_exists(pipe_name: &str) -> bool {
     let wide: Vec<u16> = OsStr::new(pipe_name)
         .encode_wide()
@@ -150,14 +198,14 @@ pub fn pipe_exists(pipe_name: &str) -> bool {
     io::Error::last_os_error().raw_os_error() != Some(ERROR_FILE_NOT_FOUND.0 as i32)
 }
 
-/// 创建 一个 已知 SID (返回 SID 字节).
-fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u8>, PwError> {
+/// 创建一个已知 SID (返回对齐的 SID 字节)
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<AlignedBuffer, PwError> {
     let mut len = 0u32;
-    // 首次调用 用于查询所需缓冲区大小, 按约定 必然返回 Err (ERROR_INSUFFICIENT_BUFFER),
-    // 属 预期失败, 忽略.
+    // 首次调用用于查询所需缓冲区大小, 按约定必然返回 Err (ERROR_INSUFFICIENT_BUFFER),
+    // 属预期失败, 忽略.
     let _ = unsafe { CreateWellKnownSid(kind, None, None, &mut len) };
 
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = AlignedBuffer::new_zeroed(len as usize);
     unsafe {
         CreateWellKnownSid(
             kind,
@@ -170,22 +218,23 @@ fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u8>, PwError> {
     Ok(buf)
 }
 
-/// 读取 当前进程 令牌中的 用户 SID (返回 SID 字节).
-fn current_user_sid() -> Result<Vec<u8>, PwError> {
+/// 读取当前进程令牌中的用户 SID (返回对齐的 SID 字节)
+fn current_user_sid() -> Result<AlignedBuffer, PwError> {
     let process = unsafe { GetCurrentProcess() };
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
         .map_err(|e| PwError::Ipc(format!("OpenProcessToken: {}", e)))?;
+    let token = HandleGuard(token);
 
     let mut needed = 0u32;
-    // 首次调用 用于查询所需缓冲区大小, 按约定 必然返回 Err (ERROR_INSUFFICIENT_BUFFER),
-    // 属 预期失败, 忽略.
-    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    // 首次调用用于查询所需缓冲区大小, 按约定必然返回 Err (ERROR_INSUFFICIENT_BUFFER),
+    // 属预期失败, 忽略.
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut needed) };
 
-    let mut buf = vec![0u8; needed as usize];
+    let mut buf = AlignedBuffer::new_zeroed(needed as usize);
     unsafe {
         GetTokenInformation(
-            token,
+            token.0,
             TokenUser,
             Some(buf.as_mut_ptr() as *mut c_void),
             needed,
@@ -194,10 +243,9 @@ fn current_user_sid() -> Result<Vec<u8>, PwError> {
     }
     .map_err(|e| PwError::Ipc(format!("GetTokenInformation: {}", e)))?;
 
-    // 关闭令牌句柄 失败 属 罕见异常, 且 无 后续处理 需要, 忽略.
-    let _ = unsafe { CloseHandle(token) };
-
     let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
     let sid_len = unsafe { GetLengthSid(sid) } as usize;
-    Ok(unsafe { slice::from_raw_parts(sid.0 as *const u8, sid_len) }.to_vec())
+    Ok(AlignedBuffer::from_slice(unsafe {
+        slice::from_raw_parts(sid.0 as *const u8, sid_len)
+    }))
 }

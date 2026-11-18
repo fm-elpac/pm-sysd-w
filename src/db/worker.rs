@@ -1,70 +1,43 @@
-//! 数据库后台线程与 请求/响应 辅助逻辑.
+//! 数据库后台线程与请求/响应辅助逻辑.
 
 use std::sync::{
     Arc,
     mpsc::{self, SyncSender},
 };
 
-use tokio::sync::mpsc as tmpsc;
+use tokio::sync::oneshot;
 
-use super::{Db, DbError, LogPageRaw};
+use super::{Db, DbError, LogPageRaw, LogPos, UnitState};
 
 /// 发给数据库读写线程的请求
 pub enum DbRequest {
-    /// 读取 meta 键值
-    MetaGet {
-        key: String,
-        resp: tmpsc::Sender<Result<Option<String>, DbError>>,
+    /// 读取 unit 表全部数据
+    UnitListAll {
+        resp: oneshot::Sender<Result<Vec<UnitState>, DbError>>,
     },
-    /// 写入 meta 键值
-    MetaSet {
-        key: String,
-        value: String,
-        resp: tmpsc::Sender<Result<(), DbError>>,
+    /// 写入一个 unit 的完整状态
+    UnitWrite {
+        state: UnitState,
+        resp: oneshot::Sender<Result<(), DbError>>,
     },
     /// 对数据库执行 vacuum
     Vacuum {
-        resp: tmpsc::Sender<Result<(), DbError>>,
+        resp: oneshot::Sender<Result<(), DbError>>,
     },
-    /// 设置 unit enable 状态
-    UnitSetEnabled {
-        name: String,
-        enabled: bool,
-        resp: tmpsc::Sender<Result<(), DbError>>,
-    },
-    /// 设置 unit mask 状态
-    UnitSetMasked {
-        name: String,
-        masked: bool,
-        resp: tmpsc::Sender<Result<(), DbError>>,
-    },
-    /// 读取全部 enable 的 unit 名称
-    UnitListEnabled {
-        resp: tmpsc::Sender<Result<Vec<String>, DbError>>,
-    },
-    /// 读取全部 mask 的 unit 名称
-    UnitListMasked {
-        resp: tmpsc::Sender<Result<Vec<String>, DbError>>,
-    },
-    /// 统计匹配条件的日志总量
-    LogTotal {
+    /// 读取日志分页 (按请求方向排序), 同时返回匹配条件的日志总量
+    LogPage {
         level: Option<String>,
         unit: Option<String>,
-        resp: tmpsc::Sender<Result<u64, DbError>>,
-    },
-    /// 读取日志分页 (按 id 倒序)
-    LogPageRaw {
-        level: Option<String>,
-        unit: Option<String>,
+        asc: bool,
+        pos: LogPos,
         limit: u32,
-        cursor: Option<i64>,
         max_msg_bytes: usize,
-        resp: tmpsc::Sender<Result<LogPageRaw, DbError>>,
+        resp: oneshot::Sender<Result<LogPageRaw, DbError>>,
     },
     /// 删除时间戳早于 `ts` 的日志
     LogDeleteBefore {
         ts: String,
-        resp: tmpsc::Sender<Result<u64, DbError>>,
+        resp: oneshot::Sender<Result<u64, DbError>>,
     },
 }
 
@@ -77,11 +50,11 @@ pub fn send_req(tx: &SyncSender<DbRequest>, req: DbRequest) -> Result<(), DbErro
 }
 
 /// 等待数据库读写线程的响应 (async)
-pub async fn recv_resp<T>(rx: &mut tmpsc::Receiver<Result<T, DbError>>) -> Result<T, DbError> {
-    match rx.recv().await {
-        Some(Ok(v)) => Ok(v),
-        Some(Err(e)) => Err(e),
-        None => Err(DbError::Msg("db worker stopped".into())),
+pub async fn recv_resp<T>(rx: oneshot::Receiver<Result<T, DbError>>) -> Result<T, DbError> {
+    match rx.await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(DbError::Msg("db worker stopped".into())),
     }
 }
 
@@ -89,36 +62,25 @@ pub async fn recv_resp<T>(rx: &mut tmpsc::Receiver<Result<T, DbError>>) -> Resul
 pub fn db_worker(db: Arc<Db>, rx: mpsc::Receiver<DbRequest>) {
     while let Ok(req) = rx.recv() {
         match req {
-            DbRequest::MetaGet { key, resp } => send_resp(resp, db.meta_get(&key)),
-            DbRequest::MetaSet { key, value, resp } => send_resp(resp, db.meta_set(&key, &value)),
+            DbRequest::UnitListAll { resp } => send_resp(resp, db.unit_list_all()),
+            DbRequest::UnitWrite { state, resp } => send_resp(resp, db.unit_write(&state)),
             DbRequest::Vacuum { resp } => send_resp(resp, db.vacuum()),
-            DbRequest::UnitSetEnabled {
-                name,
-                enabled,
-                resp,
-            } => send_resp(resp, db.unit_set_enabled(&name, enabled)),
-            DbRequest::UnitSetMasked { name, masked, resp } => {
-                send_resp(resp, db.unit_set_masked(&name, masked))
-            }
-            DbRequest::UnitListEnabled { resp } => send_resp(resp, db.unit_list_enabled()),
-            DbRequest::UnitListMasked { resp } => send_resp(resp, db.unit_list_masked()),
-            DbRequest::LogTotal { level, unit, resp } => {
-                send_resp(resp, db.log_total(level.as_deref(), unit.as_deref()))
-            }
-            DbRequest::LogPageRaw {
+            DbRequest::LogPage {
                 level,
                 unit,
+                asc,
+                pos,
                 limit,
-                cursor,
                 max_msg_bytes,
                 resp,
             } => send_resp(
                 resp,
-                db.log_page_raw(
+                db.log_page(
                     level.as_deref(),
                     unit.as_deref(),
+                    asc,
+                    pos,
                     limit,
-                    cursor,
                     max_msg_bytes,
                 ),
             ),
@@ -127,10 +89,9 @@ pub fn db_worker(db: Arc<Db>, rx: mpsc::Receiver<DbRequest>) {
     }
 }
 
-/// 把结果通过响应 MPSC 发回
-fn send_resp<T: std::fmt::Debug>(
-    resp: tmpsc::Sender<Result<T, DbError>>,
-    value: Result<T, DbError>,
-) {
-    resp.try_send(value).expect("db response receiver dropped");
+/// 把结果通过响应 oneshot 发回
+fn send_resp<T>(resp: oneshot::Sender<Result<T, DbError>>, value: Result<T, DbError>) {
+    // 调用方已放弃等待 (例如 async 任务被取消) 时 receiver 已丢弃,
+    // 此时直接丢弃结果即可, 不影响数据库状态.
+    let _ = resp.send(value);
 }

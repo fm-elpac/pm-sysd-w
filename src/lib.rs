@@ -15,6 +15,7 @@ pub mod jsonl;
 pub mod logd;
 pub mod pa;
 pub mod sysd;
+pub mod sysu;
 
 #[cfg(target_os = "linux")]
 pub mod p_u;

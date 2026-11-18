@@ -12,7 +12,11 @@ fn main() -> Result<(), ExitCode> {
     init_env_logger();
 
     if let Some(a) = cli_arg(print_version) {
-        init::main(a)
+        if a.first().map(String::as_str) == Some("--reload") {
+            init::main_reload(&a)
+        } else {
+            init::main(a, print_version)
+        }
     } else {
         // pm-bin 会处理 --version 和 --版本
         Ok(())

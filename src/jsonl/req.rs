@@ -1,6 +1,10 @@
 //! ctl / log 发给 init 的请求消息 (结构化).
 
+use std::fmt::Debug;
+
 use serde::{Deserialize, Serialize};
+
+use super::SdReqLogRO;
 
 /// ctl 发给 init 的请求.
 ///
@@ -30,6 +34,28 @@ impl SdReq {
     }
 }
 
+/// 分页查询条件: 开始位置 (通用).
+///
+/// `开始位置` 表示应该返回结果的第一条数据.
+/// 返回多少条由查询方向与 `limit` 决定, 本枚举不限定查询范围.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "C: Serialize", deserialize = "C: Deserialize<'de>"))]
+pub enum SdReqPagePos<C: Debug + Clone> {
+    /// 从游标处开始查询 (游标的上一条/下一条数据, 由查询方向决定).
+    ///
+    /// 游标指向的是 **已知** 数据, 所以返回结果不应包含游标指向的数据.
+    Cursor(C),
+    /// 从所有数据的最前面 (最旧数据) 开始, 向后跳过 `n` 条, 作为开始位置.
+    ///
+    /// 如果不跳过, 使用 `Start(0)`.
+    Start(usize),
+    /// 从所有数据的最后面 (最新数据) 开始, 向前跳过 `n` 条, 作为开始位置.
+    ///
+    /// 如果不跳过, 使用 `End(0)`.
+    /// 升序查询时若跳过条数超过已有条数, 则从最旧数据开始.
+    End(usize),
+}
+
 /// SysD 组件直接处理的请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -42,52 +68,38 @@ pub enum SdReqSysd {
     SqliteVacuum,
 }
 
-/// 日志 只读查询请求
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "kebab-case")]
-pub enum SdReqLogRO {
-    /// 读取日志
-    Query(SdReqLogQuery),
-}
-
-/// 日志查询条件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SdReqLogQuery {
-    /// 按 level 过滤 (省略则不过滤)
-    #[serde(default)]
-    pub level: Option<String>,
-    /// 按 unit 过滤 (省略则不过滤)
-    #[serde(default)]
-    pub unit: Option<String>,
-    /// 每页最多读取条数
-    #[serde(default)]
-    pub limit: u32,
-    /// 分页游标 (`Some(id)` 时读取 `id < cursor` 的日志; 省略, 则读取最新).
-    #[serde(default)]
-    pub cursor: Option<i64>,
-}
-
 /// UnitD 只读查询 (不针对单个 unit)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum SdReqUnitdRO {
     /// 读取默认 target
     GetDefault,
-    /// 列出 unit
-    ListUnits,
+    /// 列出 unit (分页)
+    ListUnits(SdReqUnitList),
     /// 列出 timer
     ListTimers,
     /// 显示环境变量 (初版 TODO)
     ShowEnvironment,
 }
 
-/// UnitD 修改操作 (不针对单个 unit).
+/// `list-units` 分页查询条件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdReqUnitList {
+    /// 每页最多返回条数
+    #[serde(default)]
+    pub limit: u32,
+    /// 分页游标: `Some(name)` 时读取 `name > cursor` 的 unit. 省略, 则从第一个开始.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// UnitD 修改操作 (不针对单个 unit)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum SdReqUnitd {
     /// 设置默认 target
     SetDefault {
-        /// target 名称.
+        /// target 名称
         target: String,
     },
     /// 设置 环境变量 (初版 TODO)
@@ -150,7 +162,7 @@ pub enum SdReqUnitOp {
     },
     /// reenable
     Reenable,
-    /// preset (初版 TODO)
+    /// preset
     Preset,
     /// mask
     Mask {

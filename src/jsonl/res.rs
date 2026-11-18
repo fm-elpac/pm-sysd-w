@@ -1,26 +1,59 @@
 //! init 回复给 ctl / log 的响应消息 (结构化)
 
+use std::fmt::Debug;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
     conf::{Unit, UnitType},
-    sysd::{EnableSta, LoadSta, UnitSta, UnitSubSta},
+    sysu::{EnableSta, LoadSta, UnitSta, UnitSubSta},
 };
 
-/// 一条日志记录
+use super::SdResLogPage;
+
+/// init 回复给 ctl 的响应 (结构化)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SdResLogEntry {
-    /// 自增 id
-    pub id: i64,
-    /// 时间戳 (UTC, ISO 8601)
-    pub ts: String,
-    /// 日志级别
-    pub level: String,
-    /// 关联 unit 名 (可为空)
-    pub unit: Option<String>,
-    /// 日志内容
-    pub msg: String,
+#[serde(tag = "res", content = "data", rename_all = "kebab-case")]
+pub enum SdRes {
+    /// 操作成功 (可选提示消息, 由 ctl 打印)
+    Ok(Option<String>),
+    /// 操作失败 (携带错误消息, 尽力而为)
+    Err(String),
+    /// (分页) 日志查询
+    Logs(SdResLogPage),
+    /// (分页) `list-units`
+    ListUnits(SdResUnitPage),
+    /// (分页) `list-timers`
+    Timers(SdResTimerPage),
+    /// (分页) `list-dependencies`
+    Dependencies(SdResDepPage),
+    /// unit 配置查询
+    Config(Unit),
+    /// unit 状态查询 (`None` 表示未找到)
+    UnitState(Option<SdResUnitState>),
+    /// `status`
+    Status(SdResUnitStatus),
+    /// `get-default`
+    DefaultTarget(String),
 }
+
+/// 分页查询结果 (通用)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "T: Serialize, C: Serialize",
+    deserialize = "T: Deserialize<'de>, C: Deserialize<'de>"
+))]
+pub struct SdResPage<T: Debug + Clone, C: Debug + Clone> {
+    /// 匹配查询条件的数据总条数
+    pub total: u64,
+    /// 下一页游标 (`None` 表示没有更多数据)
+    pub cursor: Option<C>,
+    /// 本页数据
+    pub list: Vec<T>,
+}
+
+/// `list-units` 分页查询结果
+pub type SdResUnitPage = SdResPage<SdResUnitState, String>;
 
 /// unit 的状态 (统一接口, 用于 list-units / unit-state)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +74,19 @@ pub struct SdResUnitState {
     pub enable: EnableSta,
 }
 
+/// `list-timers` 分页查询结果
+pub type SdResTimerPage = SdResPage<SdResTimerInfo, String>;
+
+/// timer 信息 (初版为空, 保留)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdResTimerInfo {
+    /// timer 名称
+    pub name: String,
+}
+
+/// `list-dependencies` 分页查询结果
+pub type SdResDepPage = SdResPage<String, String>;
+
 /// unit 的详细状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdResUnitStatus {
@@ -56,6 +102,8 @@ pub struct SdResUnitStatus {
     pub active: UnitSta,
     /// 子状态
     pub sub: UnitSubSta,
+    /// 当前状态进入时间 (Unix 毫秒时间戳, 无状态变化时为 None)
+    pub since: Option<i64>,
     /// 按 unit 类型区分的特有状态
     pub s: SdResUnitS,
 }
@@ -84,43 +132,3 @@ pub struct SdResServiceStatus {
 /// timer 特有状态 (预留, 目前为空)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdResTimerStatus {}
-
-/// timer 信息 (初版为空, 保留)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SdResTimerInfo {
-    /// timer 名称
-    pub name: String,
-}
-
-/// init 回复给 ctl 的响应 (结构化)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "res", content = "data", rename_all = "kebab-case")]
-pub enum SdRes {
-    /// 操作成功 (可选提示消息, 由 ctl 打印)
-    Ok(Option<String>),
-    /// 操作失败 (携带错误消息, 尽力而为)
-    Err(String),
-    /// `list-units` 结果
-    ListUnits(Vec<SdResUnitState>),
-    /// `status` 结果
-    Status(SdResUnitStatus),
-    /// unit 配置查询结果
-    Config(Unit),
-    /// unit 状态查询结果 (`None` 表示未找到)
-    UnitState(Option<SdResUnitState>),
-    /// `get-default` 结果
-    DefaultTarget(String),
-    /// `list-dependencies` 结果
-    Dependencies(Vec<String>),
-    /// `list-timers` 结果
-    Timers(Vec<SdResTimerInfo>),
-    /// 日志 查询结果 (分页)
-    Logs {
-        /// 匹配条件的日志总量
-        total: u64,
-        /// 下一页游标 (无更多日志时为空)
-        cursor: Option<i64>,
-        /// 本页日志列表
-        logs: Vec<SdResLogEntry>,
-    },
-}

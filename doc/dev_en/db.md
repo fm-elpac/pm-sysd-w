@@ -1,33 +1,36 @@
-# Database Schema
+# Database Documentation
 
 pm-sysd-init uses a SQLite database to store persistent state and logs. The
 database format is an internal API and is not a stable external API.
 
-## File Location
-
-The default database file is named `pm_sysd_w_v1.db`, in the same directory as
-the main config (if the main config is `dir/XXX.toml`, the database file is
-`dir/pm_sysd_w_v1.db`). The path can be changed via `[env] SYSD_DB` in the main
-config file (default `pm_sysd_w_v1.db`; a relative path is resolved relative to
-the main config's directory).
+The database file location and the `SYSD_DB` config are in the user guide
+(`doc/user/config.md`); the database access method (dedicated threads / MPSC) is
+in the developer documentation (`doc/dev/README.md`).
 
 ## Version and Upgrades
 
 The database must store a schema version number (the `schema_version` key in the
 `pm_sysd_w_meta` table, an integer) for version detection and automatic
-upgrades. Opening flow:
+upgrades. The opening flow (version check, initialization, and upgrade) is
+entirely wrapped in a single transaction:
 
-1. First try to read the schema version and the `program` identifier; do not
-   write to the database before the version is confirmed.
-2. Only when the `pm_sysd_w_meta` table does not exist, create the database
-   schema (i.e. a new database).
-3. Only when the current version is older than the version supported by this
-   program (an upgrade is needed), run migrations; migrations are wrapped in a
-   single transaction and complete atomically (either fully succeed or fully
-   fail, never "half upgraded").
-4. Opening a newer database (created by a newer program): report an error and
-   exit; no downgrade.
-5. After migration, update `schema_version` and related metadata.
+1. Open the SQLite connection and begin a transaction; all subsequent steps run
+   inside that transaction.
+
+2. Check whether the `pm_sysd_w_meta` table exists:
+
+   - Not present: treat as a new database; create tables / indexes / initial
+     metadata.
+   - Present: read and validate `program` and `schema_version`:
+
+     - `program` is not `pm-sysd-w`: report an error and exit.
+     - Current version newer than supported: report an error and exit; no
+       downgrade.
+     - Current version older than supported: run migrations and update
+       `schema_version` and related metadata.
+
+3. Commit the transaction (any failure rolls the whole operation back, so it
+   never ends up "half initialized / half upgraded").
 
 For a new database, write the current schema version (`db::SCHEMA_VERSION`),
 plus program name / version / timestamp metadata.
@@ -73,17 +76,30 @@ Persistent state for units (enable / mask, etc.).
 | `enabled` | INTEGER | NOT NULL DEFAULT 0 | Whether enabled (0/1) |
 | `masked`  | INTEGER | NOT NULL DEFAULT 0 | Whether masked (0/1)  |
 
+The db module provides exactly two unit read/write APIs:
+
+- Read: read all rows of the unit table at once (a list of `UnitState`).
+- Write: write the complete state of one unit (`UnitState`, containing `name` /
+  `enabled` / `masked`).
+
+Persistent state cleanup: when all written values are the defaults
+(`enabled=false` and `masked=false`), the row is deleted to avoid unbounded
+growth of this table.
+
 ### `log`
 
 Log records (written by the `logd` module).
 
-| Column  | Type    | Constraint                | Description                                                                                               |
-| ------- | ------- | ------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `id`    | INTEGER | PRIMARY KEY AUTOINCREMENT | Auto-increment id                                                                                         |
-| `ts`    | TEXT    | NOT NULL                  | Timestamp (UTC, ISO 8601)                                                                                 |
-| `level` | TEXT    | NOT NULL                  | Log level for filtering (e.g. `debug`/`info`/`warn`/`error`; child process output uses `stdout`/`stderr`) |
-| `unit`  | TEXT    |                           | Related unit name (may be null)                                                                           |
-| `msg`   | TEXT    | NOT NULL                  | Log message                                                                                               |
+| Column  | Type    | Constraint                | Description                     |
+| ------- | ------- | ------------------------- | ------------------------------- |
+| `id`    | INTEGER | PRIMARY KEY AUTOINCREMENT | Auto-increment id               |
+| `ts`    | TEXT    | NOT NULL                  | Timestamp (UTC, ISO 8601)       |
+| `level` | TEXT    | NOT NULL                  | Log level                       |
+| `unit`  | TEXT    |                           | Related unit name (may be null) |
+| `msg`   | TEXT    | NOT NULL                  | Log message                     |
+
+- Log level: used for filtering, such as `debug` / `info` / `warn` / `error`;
+  subprocess output is `stdout` / `stderr`.
 
 ### Indexes
 
@@ -92,12 +108,3 @@ Log records (written by the `logd` module).
 | `idx_log_unit`  | `log` | `unit, id`  | Filter logs by unit (queries, ordered by id)  |
 | `idx_log_level` | `log` | `level, id` | Filter logs by level (queries, ordered by id) |
 | `idx_log_ts`    | `log` | `ts`        | Automatic log cleanup / time-based queries    |
-
-## Access
-
-All database access goes through the `db` module wrapper; other modules do not
-touch SQLite directly. The `db` module starts 2 dedicated (synchronous) threads:
-a database read/write thread and a log writer thread; only those two threads
-touch SQLite directly. Tokio async threads send requests to the database
-read/write thread over MPSC; each request carries a response MPSC, and the
-read/write thread sends the result back after finishing. See `src/db/`.

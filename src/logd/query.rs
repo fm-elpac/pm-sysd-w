@@ -3,12 +3,13 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    db::{DbClient, LogEntry},
-    jsonl::{SdReqLogRO, SdRes, SdResLogEntry as JsonLogEntry, encode_frame},
+    db::{DbClient, LogEntry, LogPos},
+    jsonl::{SdReqLogRO, SdReqPagePos, SdRes, SdResLogItem, SdResLogPage, encode_frame},
     pa::MAX_MESSAGE_LEN,
+    sysd::send_reply,
 };
 
-use super::{Logd, LogdError};
+use super::{LOG_PAGE_MAX, Logd, LogdError};
 
 /// 日志分页结果
 #[derive(Debug, Clone)]
@@ -16,8 +17,11 @@ pub struct LogPage {
     /// 匹配条件的日志总量
     pub total: u64,
     /// 下一页游标 (无更多日志时为空)
+    ///
+    /// 游标方向与本次查询方向一致: 升序查询时下一页为 `id > cursor`,
+    /// 降序查询时下一页为 `id < cursor`.
     pub cursor: Option<i64>,
-    /// 本页日志列表 (按 id 升序)
+    /// 本页日志列表 (按请求方向排序)
     pub entries: Vec<LogEntry>,
 }
 
@@ -31,40 +35,38 @@ impl Logd {
         self.tx.send((cmd, reply)).await
     }
 
-    /// 分页读取日志 (可选按 level / unit 过滤)
+    /// 分页读取日志 (可选按 level / unit 过滤).
     ///
-    /// `cursor` 为 `Some(id)` 时读取 `id < cursor` 的日志; 为 `None` 时读取最新.
-    /// 返回: 总量 / 下一页游标 / 本页日志 (按 id 升序).
+    /// `asc` 决定返回方向 (`true` 升序 / `false` 降序), `pos` 决定开始位置.
+    /// 返回: 总量 / 下一页游标 / 本页日志 (按 `asc` 方向排序).
     pub async fn page_entries(
         &self,
         level: Option<&str>,
         unit: Option<&str>,
+        asc: bool,
+        pos: SdReqPagePos<i64>,
         limit: u32,
-        cursor: Option<i64>,
     ) -> Result<LogPage, LogdError> {
-        page_entries_with(&self.db, level, unit, limit, cursor).await
+        page_entries_raw(&self.db, level, unit, asc, pos, limit).await
     }
 }
 
-/// 分页读取日志 (供日志查询 task 与 [`Logd::page_entries`] 使用)
-async fn page_entries_with(
+/// 分页读取日志 (返回按请求方向排序的原始页).
+async fn page_entries_raw(
     db: &DbClient,
     level: Option<&str>,
     unit: Option<&str>,
+    asc: bool,
+    pos: SdReqPagePos<i64>,
     limit: u32,
-    cursor: Option<i64>,
 ) -> Result<LogPage, LogdError> {
-    let total = db
-        .log_total(level, unit)
-        .await
-        .map_err(|e| LogdError::Db(e.to_string()))?;
-
     // 多取 1 条, 用于判断是否还有下一页
     let fetch = limit.saturating_add(1).max(1);
     let raw = db
-        .log_page_raw(level, unit, fetch, cursor, MAX_MESSAGE_LEN)
+        .log_page(level, unit, asc, to_log_pos(pos), fetch, MAX_MESSAGE_LEN)
         .await
         .map_err(|e| LogdError::Db(e.to_string()))?;
+    let total = raw.total;
     let mut rows = raw.entries;
 
     let has_more = raw.size_limited || rows.len() as u64 > limit as u64;
@@ -72,13 +74,12 @@ async fn page_entries_with(
         rows.truncate(limit as usize);
     }
 
-    // 当前页按 id 倒序取到; 记录本页最旧 id 作为下一页游标.
+    // 本页最后一条 (在请求方向上) 就是下一页游标.
     let next_cursor = if has_more {
         rows.last().map(|e| e.id)
     } else {
         None
     };
-    rows.reverse();
 
     Ok(LogPage {
         total,
@@ -87,16 +88,31 @@ async fn page_entries_with(
     })
 }
 
+/// 把 jsonl 的分页位置转换为数据库内部表示.
+fn to_log_pos(pos: SdReqPagePos<i64>) -> LogPos {
+    match pos {
+        SdReqPagePos::Cursor(c) => LogPos::Cursor(c),
+        SdReqPagePos::Start(n) => LogPos::Start(n),
+        SdReqPagePos::End(n) => LogPos::End(n),
+    }
+}
+
 /// 处理日志查询请求, 返回响应
 async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
     match cmd {
         SdReqLogRO::Query(query) => {
-            let page = match page_entries_with(
+            // 外部请求的一页条数超过硬限制时, 自动按限制截断
+            let limit = query.limit.min(LOG_PAGE_MAX);
+            let asc = query.asc;
+            let pos = query.pos.clone();
+
+            let page = match page_entries_raw(
                 db,
-                query.level.as_deref(),
-                query.unit.as_deref(),
-                query.limit,
-                query.cursor,
+                query.filter.level.as_deref(),
+                query.filter.unit.as_deref(),
+                asc,
+                pos,
+                limit,
             )
             .await
             {
@@ -104,10 +120,11 @@ async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
                 Err(e) => return SdRes::Err(e.to_string()),
             };
 
-            let mut logs: Vec<JsonLogEntry> = page
+            // 数据库已按请求方向返回
+            let mut items: Vec<SdResLogItem> = page
                 .entries
                 .into_iter()
-                .map(|e| JsonLogEntry {
+                .map(|e| SdResLogItem {
                     id: e.id,
                     ts: e.ts,
                     level: e.level,
@@ -115,38 +132,36 @@ async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
                     msg: e.msg,
                 })
                 .collect();
-            // 最新在前, 便于按前缀选择要返回的日志.
-            logs.reverse();
 
             let total = page.total;
-            let original_len = logs.len();
-            let selected = select_logs_by_estimate(&logs, MAX_MESSAGE_LEN);
-            logs.truncate(selected);
+            let original_len = items.len();
+            let selected = select_logs_by_estimate(&items, MAX_MESSAGE_LEN);
+            items.truncate(selected);
 
-            // 估算截断时, 游标指向本页最旧一条 (被截断的更旧日志下次继续拉取);
+            // 估算截断时, 游标指向本页保留的最后一条 (被截断的数据下次继续拉取).
             // 未截断时保持原游标.
             let mut cursor = if selected < original_len {
-                logs.last().map(|e| e.id)
+                items.last().map(|e| e.id)
             } else {
                 page.cursor
             };
 
-            // 兜底: encode 实测一次; 若仍超限且不止 1 条, 从末尾 (最旧) 移除.
+            // 兜底: encode 实测一次. 若仍超限且不止 1 条, 从末尾移除.
             loop {
-                let resp = SdRes::Logs {
+                let resp = SdRes::Logs(SdResLogPage {
                     total,
                     cursor,
-                    logs: logs.clone(),
-                };
+                    list: items.clone(),
+                });
                 let line = match encode_frame(&resp) {
                     Ok(line) => line,
                     Err(e) => return SdRes::Err(e.to_string()),
                 };
-                if logs.len() <= 1 || line.len() <= MAX_MESSAGE_LEN {
+                if items.len() <= 1 || line.len() <= MAX_MESSAGE_LEN {
                     return resp;
                 }
-                logs.pop();
-                cursor = logs.last().map(|e| e.id);
+                items.pop();
+                cursor = items.last().map(|e| e.id);
             }
         }
     }
@@ -158,7 +173,7 @@ pub(super) async fn run(
     db: DbClient,
 ) {
     while let Some((cmd, reply)) = rx.recv().await {
-        reply.send(log_ro_resp(&db, &cmd).await).unwrap();
+        send_reply(reply, log_ro_resp(&db, &cmd).await);
     }
 }
 
@@ -169,7 +184,7 @@ const LOG_JSON_EXPAND: f64 = 7.8;
 const LOG_JSON_OVERHEAD: f64 = 137.0;
 
 /// 估算单条日志 JSON 编码后的字节数
-fn estimate_log_entry_len(e: &JsonLogEntry) -> usize {
+fn estimate_log_entry_len(e: &SdResLogItem) -> usize {
     (e.msg.len() as f64 * LOG_JSON_EXPAND
         + e.ts.len() as f64
         + e.level.len() as f64
@@ -178,10 +193,10 @@ fn estimate_log_entry_len(e: &JsonLogEntry) -> usize {
         .ceil() as usize
 }
 
-/// 从日志列表 (最新在前) 选择前缀, 使估算总长度不超过 `max`.
+/// 从日志列表 (按请求方向排序) 选择前缀, 使估算总长度不超过 `max`.
 ///
-/// 至少返回 1 条 (若列表非空).
-fn select_logs_by_estimate(logs: &[JsonLogEntry], max: usize) -> usize {
+/// 若列表非空, 至少返回 1 条.
+fn select_logs_by_estimate(logs: &[SdResLogItem], max: usize) -> usize {
     let mut total = 0usize;
     for (i, e) in logs.iter().enumerate() {
         let add = estimate_log_entry_len(e);

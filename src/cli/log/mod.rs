@@ -7,13 +7,16 @@
 
 use std::process::ExitCode;
 
-use chrono::{DateTime, Local};
 use tokio::runtime::Runtime;
 
 use crate::{
     cli::{complete_unit, connect, resolve_instance, set_instance},
-    jsonl::{SdReq, SdReqLogQuery, SdReqLogRO, SdRes, SdResLogEntry, decode_frame, encode_frame},
-    pa::{Instance, hostname},
+    jsonl::{
+        SdReq, SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdReqPagePos, SdRes, SdResLogItem,
+        decode_frame, encode_frame,
+    },
+    pa::Instance,
+    sysu::log::print_logs,
 };
 
 mod error;
@@ -59,7 +62,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    // 解析 实际连接的实例: 与 pm-sysd-ctl 一致, 未显式指定时优先 --system,
+    // 解析实际连接的实例: 与 pm-sysd-ctl 一致, 未显式指定时优先 --system,
     // 不存在则回退 --user.
     let instance = match resolve_instance(args.instance) {
         Ok(i) => i,
@@ -78,7 +81,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
     }
 }
 
-/// 解析 命令行参数.
+/// 解析命令行参数
 fn parse_args(a: &[String]) -> Result<Args, LogError> {
     let mut instance: Option<Instance> = None;
     let mut unit: Option<String> = None;
@@ -89,7 +92,7 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
         match arg.as_str() {
             "--system" => set_instance(&mut instance, Instance::System).map_err(LogError::Msg)?,
             "--user" => set_instance(&mut instance, Instance::User).map_err(LogError::Msg)?,
-            // `-e` (跳到末尾) 是默认行为, 接受并忽略.
+            // `-e` (跳到末尾) 是默认行为, 接受并忽略
             "-e" | "-x" | "-xe" | "--pager-end" | "--catalog" => {}
             // `-eu UNIT` / `-euUNIT`: `-e` + `-u` (unit 过滤).
             arg if arg.starts_with("-eu") => {
@@ -143,22 +146,35 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
     Ok(Args { instance, unit })
 }
 
-/// 主流程.
+/// 主流程
 async fn run(unit: Option<String>, instance: Instance) -> Result<(), LogError> {
     let mut stream = connect(&instance).await.map_err(LogError::Msg)?;
 
-    // 分页读取: logd 会按 1MB 消息上限主动减少每页条数, 这里循环拉取直到
-    // 凑够 DEFAULT_LIMIT 条或没有更多日志.
+    // 首次请求直接取最新 DEFAULT_LIMIT 条 (升序), 若单页装不下则按游标继续拉取.
+    // 全程使用 asc=true, 页面内与页面间都保持 id 升序, 无需 reverse/sort.
     let mut cursor: Option<i64> = None;
-    let mut all: Vec<SdResLogEntry> = Vec::new();
+    let mut all: Vec<SdResLogItem> = Vec::new();
+    let mut first = true;
     while (all.len() as u32) < DEFAULT_LIMIT {
         let limit = DEFAULT_LIMIT - all.len() as u32;
+        let pos = if first {
+            // 从最新数据向前跳过 (DEFAULT_LIMIT - 1) 条, 即从第 DEFAULT_LIMIT 条
+            // 最新数据开始, 升序返回最新 DEFAULT_LIMIT 条.
+            SdReqPagePos::End((DEFAULT_LIMIT - 1) as usize)
+        } else {
+            SdReqPagePos::Cursor(cursor.expect("continue page needs cursor"))
+        };
+        first = false;
+
         let command = SdReq::LogRO(SdReqLogRO::Query(SdReqLogQuery {
-            // pm-sysd-log 暂不实现按 level 过滤, 固定不过滤.
-            level: None,
-            unit: unit.clone(),
+            // pm-sysd-log 暂不实现按 level 过滤, 固定不过滤
+            filter: SdReqLogQueryFilter {
+                level: None,
+                unit: unit.clone(),
+            },
+            pos,
+            asc: true,
             limit,
-            cursor,
         }));
         let line = encode_frame(&command).map_err(|e| LogError::Msg(e.to_string()))?;
         stream
@@ -172,12 +188,10 @@ async fn run(unit: Option<String>, instance: Instance) -> Result<(), LogError> {
             .map_err(|e| LogError::Msg(e.to_string()))?;
         let resp: SdRes = decode_frame(&line).map_err(|e| LogError::Msg(e.to_string()))?;
         match resp {
-            SdRes::Logs {
-                logs, cursor: next, ..
-            } => {
-                let count = logs.len();
-                all.extend(logs);
-                cursor = next;
+            SdRes::Logs(page) => {
+                let count = page.list.len();
+                all.extend(page.list);
+                cursor = page.cursor;
                 if count == 0 || cursor.is_none() {
                     break;
                 }
@@ -187,32 +201,11 @@ async fn run(unit: Option<String>, instance: Instance) -> Result<(), LogError> {
         }
     }
 
-    // 多页之间按 id 升序输出, 与单页内顺序保持一致.
-    all.sort_by_key(|e| e.id);
     print_logs(&all);
     Ok(())
 }
 
-/// 打印日志 (模仿 journalctl 的 short 格式).
-fn print_logs(logs: &[SdResLogEntry]) {
-    for e in logs {
-        let program = e.unit.as_deref().unwrap_or("pm-sysd-w");
-        println!("{} {} {}: {}", format_ts(&e.ts), hostname(), program, e.msg);
-    }
-}
-
-/// 时间戳 (UTC ISO 8601) -> 本地时间 `MMM DD HH:MM:SS`.
-fn format_ts(ts: &str) -> String {
-    match DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt
-            .with_timezone(&Local)
-            .format("%b %d %H:%M:%S")
-            .to_string(),
-        Err(_) => ts.to_string(),
-    }
-}
-
-/// 打印 帮助.
+/// 打印帮助
 fn print_help() {
     println!("pm-sysd-log: pm-sysd-w 日志查看工具 (类似 journalctl)");
     println!();

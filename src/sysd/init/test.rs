@@ -2,9 +2,9 @@
 
 use crate::{
     jsonl::{
-        Hello, SdReq, SdReqLogQuery, SdReqLogRO, SdReqSysd, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO,
-        SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdRes, VERSION, decode_frame, decode_hello,
-        encode_frame, encode_hello,
+        Hello, SdReq, SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdReqPagePos, SdReqSysd,
+        SdReqUnit, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdRes,
+        VERSION, decode_frame, decode_hello, encode_frame, encode_hello,
     },
     pa::{Instance, IpcAcl, SysdClient, SysdServer, ipc_exists},
     sysd::test_util,
@@ -13,17 +13,28 @@ use crate::{
 
 use super::{Shutdown, handle_conn};
 
+/// 测试用的版本输出函数 (不输出).
+fn noop_print_version() {}
+
 #[test]
 fn is_readonly_accepts_read_queries() {
     assert!(SdReq::is_readonly(&SdReq::LogRO(SdReqLogRO::Query(
         SdReqLogQuery {
-            level: None,
-            unit: None,
+            filter: SdReqLogQueryFilter {
+                level: None,
+                unit: None,
+            },
+            pos: SdReqPagePos::Start(0),
+            asc: true,
             limit: 0,
-            cursor: None,
         }
     ))));
-    assert!(SdReq::is_readonly(&SdReq::UnitdRO(SdReqUnitdRO::ListUnits)));
+    assert!(SdReq::is_readonly(&SdReq::UnitdRO(
+        SdReqUnitdRO::ListUnits(crate::jsonl::SdReqUnitList {
+            limit: 0,
+            cursor: None,
+        })
+    )));
     assert!(SdReq::is_readonly(&SdReq::UnitRO(SdReqUnitRO {
         name: "t.service".to_string(),
         op: SdReqUnitOpRO::Status,
@@ -50,7 +61,7 @@ async fn readonly_connection_rejects_modifying_command() {
 
     let conn = tokio::spawn(async move {
         let conn = server.accept().await.unwrap();
-        handle_conn(conn, sysd, true).await;
+        handle_conn(conn, sysd, true, 1).await;
     });
 
     let mut client = SysdClient::connect(&instance).await.unwrap();
@@ -108,7 +119,7 @@ async fn run_exit_via_client() {
     let conf_path = conf_path.to_string_lossy().into_owned();
 
     let instance = Instance::Machine(format!("init_exit_{}", std::process::id()));
-    let task = tokio::spawn(super::run(instance.clone(), conf_path));
+    let task = tokio::spawn(super::run(instance.clone(), conf_path, noop_print_version));
 
     let mut client = connect_client(&instance).await;
     client
@@ -131,7 +142,7 @@ async fn run_soft_reboot_via_client() {
     let conf_path = conf_path.to_string_lossy().into_owned();
 
     let instance = Instance::Machine(format!("init_reboot_{}", std::process::id()));
-    let task = tokio::spawn(super::run(instance.clone(), conf_path));
+    let task = tokio::spawn(super::run(instance.clone(), conf_path, noop_print_version));
 
     let mut client = connect_client(&instance).await;
     client
@@ -156,6 +167,6 @@ async fn run_bad_conf_returns_error() {
         .into_owned();
 
     let instance = Instance::Machine(format!("init_bad_{}", std::process::id()));
-    let r = super::run(instance, conf_path).await;
+    let r = super::run(instance, conf_path, noop_print_version).await;
     assert!(r.is_err());
 }

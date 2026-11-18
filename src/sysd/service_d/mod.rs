@@ -4,38 +4,22 @@
 //! 与活跃 ServiceS 的句柄映射; actor (`service_d::actor`) 只执行状态机输出的 IO
 //! 请求. 查询类请求只读取状态, 由 actor 直接组合句柄与状态机数据回复.
 //!
-//! ServiceS 的创建 (新启动) 不直接在主循环中执行, 而是交给一个专用 job 队列
-//! (另一个 async task) 串行处理: 主循环只入队创建 job (携带初始消息), job 队列
-//! 创建 ServiceS 后无阻塞转发初始消息 (不等待执行完成).
+//! ServiceS 由 ServiceD actor 直接创建 / 启动: actor 先同步登记句柄与 active 状态,
+//! 再投递初始命令, 避免创建与 ServiceS 退出之间的异步竞态.
 
-use crate::{
-    conf::Unit,
-    jsonl::SdReqUnitOp,
-    sysd::{ServiceSta, UnitSta},
-};
+use serde::Serialize;
+
+use crate::{conf::Unit, jsonl::SdReqUnitOp};
 
 mod actor;
 mod query;
 mod sm;
 
-#[cfg(test)]
-mod test;
-
-pub use actor::{ServiceD, ServiceDM};
+pub use actor::{MS, ServiceD, ServiceDM};
 pub use sm::ServiceOp;
 
-/// service 详细状态快照
-#[derive(Debug, Clone, Copy)]
-pub struct StatusInfo {
-    pub active: UnitSta,
-    pub sub: ServiceSta,
-    pub pid: Option<u32>,
-    pub restart_count: u32,
-    pub exit_status: Option<i32>,
-}
-
 /// 单个 unit 操作 (统一结构)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ServiceCmdUnit {
     /// unit 名称 (ResetFailed 时 "" 表示全部)
     pub name: String,

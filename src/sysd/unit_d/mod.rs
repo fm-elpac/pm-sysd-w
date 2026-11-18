@@ -7,12 +7,9 @@
 //! enable/mask 持久化, 启动时读取, 平时通过 WriteDb 动作更新.
 
 mod actor;
-mod load;
 mod query;
 mod sm;
 mod unit_s;
 
-#[cfg(test)]
-mod test;
-
 pub use actor::{UnitD, UnitDM};
+pub use unit_s::UnitSME;

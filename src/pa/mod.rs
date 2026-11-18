@@ -17,7 +17,6 @@ use std::{
     time::Duration,
 };
 
-use log::warn;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdout, Command},
@@ -25,6 +24,8 @@ use tokio::{
     time::timeout,
 };
 
+#[cfg(target_os = "linux")]
+use log::warn;
 #[cfg(target_os = "linux")]
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -44,8 +45,39 @@ mod test;
 
 pub use error::PaError;
 
-/// 单条消息最大长度 (字节), 超出报错并关闭连接
-pub const MAX_MESSAGE_LEN: usize = 1024 * 1024;
+/// 流式文本解码器.
+///
+/// 连续输入多个字节缓冲区, 解码结果按字符边界返回; 未构成完整字符的字节
+/// 保留在解码器内部, 下次输入继续解码.
+///
+/// - Linux: 固定按 UTF-8 解码.
+/// - Windows: 先按 UTF-8 解码, 失败后切换到系统 ACP 模式; ACP 再失败则
+///   返回错误并退出 ACP 模式.
+pub struct TextDecoder {
+    inner: p::TextDecoder,
+}
+
+impl TextDecoder {
+    /// 创建新的解码器
+    pub fn new() -> Self {
+        Self {
+            inner: p::TextDecoder::new(),
+        }
+    }
+
+    /// 输入一个字节缓冲区, 返回已解码的字符串
+    pub fn decode(&mut self, bytes: &[u8]) -> Result<String, PaError> {
+        self.inner.decode(bytes).map_err(PaError::from)
+    }
+
+    /// 结束输入: 解码内部剩余字节
+    pub fn finish(&mut self) -> Result<String, PaError> {
+        self.inner.finish().map_err(PaError::from)
+    }
+}
+
+/// 单条消息最大长度 (字节, 10MB), 超出报错并关闭连接
+pub const MAX_MESSAGE_LEN: usize = 10 * 1024 * 1024;
 
 /// 单条消息发送超时
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -259,7 +291,10 @@ pub fn soft_reboot(args: &[String]) -> Result<(), PaError> {
 
 /// 启动外部优雅退出信号监听任务.
 ///
-/// Linux: SIGTERM; Windows: Ctrl-C. 收到信号后向 `tx` 发送一次 `()`.
+/// Linux: SIGTERM.
+/// Windows: Ctrl-C (命令行) 或 (服务模式) 服务停止请求.
+///
+/// 收到信号后向 `tx` 发送一次 `()`.
 pub fn spawn_signal_watch(tx: mpsc::Sender<()>) {
     #[cfg(unix)]
     {
@@ -278,10 +313,18 @@ pub fn spawn_signal_watch(tx: mpsc::Sender<()>) {
 
     #[cfg(windows)]
     {
+        let service = p::service::is_service();
+        let stop = p::service::stop_event();
+
         tokio::spawn(async move {
-            if ctrl_c().await.is_ok() {
-                tx.send(()).await.expect("signal watch receiver dropped");
+            if service {
+                // Windows 服务模式: 等待 SCM 停止请求 (无控制台, 不监听 Ctrl+C).
+                stop.wait().await;
+            } else if ctrl_c().await.is_err() {
+                // Ctrl+C 监听失败 (例如无控制台): 保持等待, 不发送退出信号.
+                return;
             }
+            tx.send(()).await.expect("signal watch receiver dropped");
         });
     }
 }

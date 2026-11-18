@@ -2,7 +2,7 @@
 
 use crate::test::TempDir;
 
-use super::{Db, PROGRAM_NAME};
+use super::{Db, LogPos, PROGRAM_NAME, UnitState};
 
 fn tmp_db(dir: &TempDir, name: &str) -> String {
     dir.path().join(name).to_string_lossy().into_owned()
@@ -20,11 +20,21 @@ fn open_and_persist() {
     );
     assert_eq!(db.meta_get("schema_version").unwrap().as_deref(), Some("1"));
 
-    db.unit_set_enabled("a.service", true).unwrap();
-    assert_eq!(db.unit_list_enabled().unwrap(), vec!["a.service"]);
+    let enabled = UnitState {
+        name: "a.service".into(),
+        enabled: true,
+        masked: false,
+    };
+    db.unit_write(&enabled).unwrap();
+    assert_eq!(db.unit_list_all().unwrap(), vec![enabled]);
 
-    db.unit_set_masked("a.service", true).unwrap();
-    assert_eq!(db.unit_list_masked().unwrap(), vec!["a.service"]);
+    let masked = UnitState {
+        name: "a.service".into(),
+        enabled: true,
+        masked: true,
+    };
+    db.unit_write(&masked).unwrap();
+    assert_eq!(db.unit_list_all().unwrap(), vec![masked]);
 }
 
 #[test]
@@ -32,14 +42,48 @@ fn reopen_keeps_state() {
     let dir = TempDir::new("db");
     let path = tmp_db(&dir, "a.db");
 
+    let state = UnitState {
+        name: "a.service".into(),
+        enabled: true,
+        masked: false,
+    };
     {
         let db = Db::open(&path).unwrap();
-        db.unit_set_enabled("a.service", true).unwrap();
+        db.unit_write(&state).unwrap();
     }
     {
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.unit_list_enabled().unwrap(), vec!["a.service"]);
+        assert_eq!(db.unit_list_all().unwrap(), vec![state]);
     }
+}
+
+#[test]
+fn unit_write_default_deletes_row() {
+    let dir = TempDir::new("db");
+    let path = tmp_db(&dir, "a.db");
+
+    let db = Db::open(&path).unwrap();
+
+    // 全默认值: 不保留行.
+    let default = UnitState {
+        name: "a.service".into(),
+        enabled: false,
+        masked: false,
+    };
+    db.unit_write(&default).unwrap();
+    assert!(db.unit_list_all().unwrap().is_empty());
+
+    // 先写非默认, 再写默认, 行被删除 (自动清理).
+    db.unit_write(&UnitState {
+        name: "a.service".into(),
+        enabled: true,
+        masked: false,
+    })
+    .unwrap();
+    assert_eq!(db.unit_list_all().unwrap().len(), 1);
+
+    db.unit_write(&default).unwrap();
+    assert!(db.unit_list_all().unwrap().is_empty());
 }
 
 #[test]
@@ -59,26 +103,38 @@ fn log_append_filter() {
     .unwrap();
 
     // 按 id 倒序返回.
-    let all = db.log_page_raw(None, None, 10, None, usize::MAX).unwrap();
+    let all = db
+        .log_page(None, None, false, LogPos::End(0), 10, usize::MAX)
+        .unwrap();
+    assert_eq!(all.total, 2);
     assert_eq!(all.entries.len(), 2);
     assert_eq!(all.entries[0].msg, "boom");
     assert_eq!(all.entries[1].msg, "hello");
 
     let one = db
-        .log_page_raw(None, Some("a.service"), 10, None, usize::MAX)
+        .log_page(
+            None,
+            Some("a.service"),
+            false,
+            LogPos::End(0),
+            10,
+            usize::MAX,
+        )
         .unwrap();
+    assert_eq!(one.total, 1);
     assert_eq!(one.entries.len(), 1);
     assert_eq!(one.entries[0].msg, "boom");
 
     let err = db
-        .log_page_raw(Some("error"), None, 10, None, usize::MAX)
+        .log_page(Some("error"), None, false, LogPos::End(0), 10, usize::MAX)
         .unwrap();
+    assert_eq!(err.total, 1);
     assert_eq!(err.entries.len(), 1);
     assert_eq!(err.entries[0].msg, "boom");
 }
 
 #[test]
-fn log_page_raw_limit_and_order() {
+fn log_page_limit_and_order() {
     let dir = TempDir::new("db");
     let path = tmp_db(&dir, "a.db");
 
@@ -93,7 +149,10 @@ fn log_page_raw_limit_and_order() {
         .unwrap();
     }
 
-    let page = db.log_page_raw(None, None, 3, None, usize::MAX).unwrap();
+    let page = db
+        .log_page(None, None, false, LogPos::End(0), 3, usize::MAX)
+        .unwrap();
+    assert_eq!(page.total, 5);
     assert_eq!(page.entries.len(), 3);
     // 按 id 倒序返回, 只取最新 3 条.
     assert_eq!(page.entries[0].msg, "m4");
@@ -189,7 +248,10 @@ fn log_delete_before() {
     let n = db.log_delete_before("2026-11-11T00:00:00.000Z").unwrap();
     assert_eq!(n, 1);
 
-    let all = db.log_page_raw(None, None, 10, None, usize::MAX).unwrap();
+    let all = db
+        .log_page(None, None, false, LogPos::End(0), 10, usize::MAX)
+        .unwrap();
+    assert_eq!(all.total, 1);
     assert_eq!(all.entries.len(), 1);
     assert_eq!(all.entries[0].msg, "new");
 }
@@ -200,7 +262,12 @@ fn vacuum_ok() {
     let path = tmp_db(&dir, "a.db");
 
     let db = Db::open(&path).unwrap();
-    db.unit_set_enabled("a.service", true).unwrap();
+    db.unit_write(&UnitState {
+        name: "a.service".into(),
+        enabled: true,
+        masked: false,
+    })
+    .unwrap();
     db.vacuum().unwrap();
 }
 

@@ -23,35 +23,36 @@ use tokio::runtime::Runtime;
 
 use crate::{
     cli::{complete_unit, connect, resolve_instance, set_instance},
-    jsonl::{SdReq, SdRes, decode_frame, encode_frame},
+    jsonl::{
+        SdReq, SdReqUnitList, SdReqUnitdRO, SdRes, SdResUnitState, decode_frame, encode_frame,
+    },
     pa::Instance,
+    sysu::ctl::{print_list_units, print_response},
 };
 
 mod error;
-mod print;
 
 #[cfg(test)]
 mod test;
 
 pub use error::CtlError;
 
-use print::print_response;
+/// `list-units` 分页拉取时每页最多请求条数
+const LIST_UNITS_LIMIT: u32 = 1000;
 
-/// pm-sysd-ctl 命令行参数 (原始, 未做命令语义检查).
+/// pm-sysd-ctl 命令行参数 (原始, 未做命令语义检查)
 struct Args {
-    /// 实例 (未显式指定时为 `None`, 连接时 再解析默认实例).
+    /// 实例 (未显式指定时为 `None`, 连接时再解析默认实例)
     instance: Option<Instance>,
-    /// 命令 (字符串).
+    /// 命令 (字符串)
     command: String,
-    /// unit 位置参数.
+    /// unit 位置参数
     units: Vec<String>,
-    /// `--now` (用于 `enable --now` / `disable --now`).
+    /// `--now` (用于 `enable --now` / `disable --now`)
     now: bool,
 }
 
-/// pm-sysd-ctl 命令行入口.
-///
-/// 由 `src/bin/pm-sysd-ctl.rs` 调用.
+/// pm-sysd-ctl 命令行入口
 pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
     if a.is_empty() || a.iter().any(|s| s == "-h" || s == "--help") {
         print_help();
@@ -66,7 +67,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    // 在发送命令之前, 先做 命令语法检查 (`whoami` 不需要命令参数).
+    // 在发送命令之前, 先做命令语法检查 (`whoami` 不需要命令参数)
     let command = if args.command == "whoami" {
         None
     } else {
@@ -96,7 +97,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    // `whoami`: 报告 实际选择的实例名称.
+    // `whoami`: 报告实际选择的实例名称
     if args.command == "whoami" {
         println!("{}", instance.name());
         return Ok(());
@@ -121,7 +122,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
     }
 }
 
-/// 解析 命令行参数 (不含 命令语义检查).
+/// 解析命令行参数 (不含命令语义检查)
 fn parse_args(a: &[String]) -> Result<Args, CtlError> {
     let mut instance: Option<Instance> = None;
     let mut command: Option<String> = None;
@@ -173,7 +174,7 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
     })
 }
 
-/// 把 命令字符串 + 参数 转换为 结构化 [`SdReq`], 并做 语法检查.
+/// 把命令字符串 + 参数转换为结构化 [`SdReq`], 并做语法检查
 fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, CtlError> {
     use crate::jsonl::{
         SdReq as C, SdReqSysd as Sy, SdReqUnit as U, SdReqUnitOp as Op, SdReqUnitOpRO as Rop,
@@ -186,7 +187,7 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         ));
     }
 
-    // 读取 恰好 1 个 unit 参数 (名称未写后缀时 自动补 `.service`).
+    // 读取恰好 1 个 unit 参数 (名称未写后缀时自动补 `.service`)
     let unit = |name: &str| -> Result<String, CtlError> {
         match units.len() {
             1 => Ok(complete_unit(&units[0])),
@@ -201,7 +202,7 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         }
     };
 
-    // 读取 恰好 1 个 target 参数 (set-default 原样透传, 不做补全).
+    // 读取恰好 1 个 target 参数 (set-default 原样透传, 不做补全)
     let target = |name: &str| -> Result<String, CtlError> {
         match units.len() {
             1 => Ok(units[0].clone()),
@@ -216,7 +217,7 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         }
     };
 
-    // 要求 0 个参数.
+    // 要求 0 个参数
     let no_args = |name: &str| -> Result<(), CtlError> {
         if units.is_empty() {
             Ok(())
@@ -231,7 +232,10 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
     Ok(match command {
         "list-units" => {
             no_args(command)?;
-            C::UnitdRO(Udr::ListUnits)
+            C::UnitdRO(Udr::ListUnits(SdReqUnitList {
+                limit: LIST_UNITS_LIMIT,
+                cursor: None,
+            }))
         }
         "list-timers" => {
             no_args(command)?;
@@ -345,8 +349,8 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
             C::UnitD(Ud::UnsetEnvironment)
         }
         // import-environment 是 ctl 本地功能, 不直接对应一条 init 请求.
-        // 实现时: 读取 ctl 自身进程 对应名称的 环境变量, 用其值调用 set-environment.
-        // 目前 不实现.
+        // 实现时: 读取 ctl 自身进程对应名称的环境变量, 用其值调用 set-environment.
+        // 目前不实现.
         "import-environment" => {
             no_args(command)?;
             return Err(CtlError::Msg("import-environment not implemented".into()));
@@ -371,18 +375,23 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
     })
 }
 
-/// 主流程.
+/// 主流程
 async fn run(command: SdReq, command_name: &str, instance: Instance) -> Result<u8, CtlError> {
     let mut stream = connect(&instance).await.map_err(CtlError::Msg)?;
 
-    // 发送命令.
+    // list-units 是分页接口: 循环拉取直到没有下一页, 再统一打印.
+    if let SdReq::UnitdRO(SdReqUnitdRO::ListUnits(_)) = &command {
+        return list_units_paged(&mut stream).await;
+    }
+
+    // 发送命令
     let line = encode_frame(&command).map_err(|e| CtlError::Msg(e.to_string()))?;
     stream
         .send(line)
         .await
         .map_err(|e| CtlError::Msg(e.to_string()))?;
 
-    // 接收响应 并 格式化输出.
+    // 接收响应并格式化输出
     let line = stream
         .recv()
         .await
@@ -391,9 +400,46 @@ async fn run(command: SdReq, command_name: &str, instance: Instance) -> Result<u
     Ok(print_response(command_name, &command, resp))
 }
 
-/// 格式化/打印 响应, 返回 进程退出码.
+/// 分页拉取 `list-units` 并打印
+async fn list_units_paged(stream: &mut crate::pa::SysdClient) -> Result<u8, CtlError> {
+    let mut cursor: Option<String> = None;
+    let mut all: Vec<SdResUnitState> = Vec::new();
 
-/// 打印 帮助.
+    loop {
+        let command = SdReq::UnitdRO(SdReqUnitdRO::ListUnits(SdReqUnitList {
+            limit: LIST_UNITS_LIMIT,
+            cursor: cursor.clone(),
+        }));
+        let line = encode_frame(&command).map_err(|e| CtlError::Msg(e.to_string()))?;
+        stream
+            .send(line)
+            .await
+            .map_err(|e| CtlError::Msg(e.to_string()))?;
+
+        let line = stream
+            .recv()
+            .await
+            .map_err(|e| CtlError::Msg(e.to_string()))?;
+        let resp: SdRes = decode_frame(&line).map_err(|e| CtlError::Msg(e.to_string()))?;
+        match resp {
+            SdRes::ListUnits(page) => {
+                let count = page.list.len();
+                all.extend(page.list);
+                cursor = page.cursor;
+                if count == 0 || cursor.is_none() {
+                    break;
+                }
+            }
+            SdRes::Err(message) => return Err(CtlError::Msg(message)),
+            _ => return Err(CtlError::Msg("unexpected response from init".into())),
+        }
+    }
+
+    print_list_units(&all);
+    Ok(0)
+}
+
+/// 打印帮助
 fn print_help() {
     println!("pm-sysd-ctl: pm-sysd-w 命令行工具 (类似 systemctl)");
     println!();

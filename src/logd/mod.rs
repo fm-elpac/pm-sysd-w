@@ -8,7 +8,9 @@
 //! - 写入采用专用 (同步) 线程 + MPSC: 发送方无阻塞 (`try_send`), 接收方
 //!   使用较大缓冲区 (1000 条) 缓存来不及写入的日志, 避免日志写入阻塞主逻辑.
 //!   日志写入线程位于 `db` 模块 (`db::DbClient`), 本模块只负责拆分/投递.
+//!
 //! - 子进程 stdout/stderr 由后台任务按行 (超长分段) 读取后写入对应 unit 日志.
+//!
 //! - 日志查询命令 (`SdReqLogRO`) 由后台 task 处理, 返回分页响应.
 //!
 //! 防御性处理 (详见 `doc/dev/README.md`):
@@ -18,7 +20,7 @@
 //! - 日志自动清理: 每 [`LOG_CLEAN_INTERVAL`] 运行一次, 只保留最近
 //!   [`LOG_RETENTION`] 的日志.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use log::{info, warn};
@@ -53,6 +55,11 @@ pub const LOG_CLEAN_INTERVAL: Duration = Duration::from_secs(3600);
 /// 日志保留时长 (固定: 最近 72 小时)
 pub const LOG_RETENTION: Duration = Duration::from_secs(72 * 3600);
 
+/// 单次日志分页查询允许的最大条数 (硬限制).
+///
+/// 外部请求的一页条数超过此值时, 自动按此值截断.
+pub const LOG_PAGE_MAX: u32 = 10_000;
+
 /// 日志记录器.
 ///
 /// clone: 共享同一个数据库客户端 (数据库读写线程与日志写入线程) 与日志查询
@@ -75,9 +82,11 @@ impl Logd {
         tokio::spawn(async move {
             loop {
                 sleep(LOG_CLEAN_INTERVAL).await;
+
                 let before = (Utc::now()
                     - chrono::Duration::seconds(LOG_RETENTION.as_secs() as i64))
                 .to_rfc3339_opts(SecondsFormat::Millis, true);
+
                 match clean_db.log_delete_before(&before).await {
                     Ok(n) => {
                         if n > 0 {
@@ -153,4 +162,21 @@ fn split_msg(msg: &str, max: usize) -> Vec<String> {
 /// 当前时间 (UTC, ISO 8601, 毫秒精度)
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// 当前时间 (UTC, Unix 毫秒时间戳).
+///
+/// 用于记录 unit 运行状态的变化时间 (`status` 的 `since` 部分).
+pub fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// 把单调时钟 [`Instant`] 近似转换为 ISO 8601 时间戳 (UTC, 毫秒精度).
+///
+/// `Instant` 无法直接对应墙上时间, 这里用当前墙上时间减去该 `Instant` 已流逝的
+/// 时长来反推一个近似值, 仅用于调试 / 日志序列化.
+pub fn instant_iso(instant: &Instant) -> String {
+    let elapsed = chrono::Duration::from_std(instant.elapsed())
+        .expect("instant elapsed is within chrono duration range");
+    (Utc::now() - elapsed).to_rfc3339_opts(SecondsFormat::Millis, true)
 }

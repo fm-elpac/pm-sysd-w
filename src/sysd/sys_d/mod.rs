@@ -18,7 +18,4 @@
 mod actor;
 mod sm;
 
-#[cfg(test)]
-mod test;
-
 pub use actor::{SysD, SysDM};

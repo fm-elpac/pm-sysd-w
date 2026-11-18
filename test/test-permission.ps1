@@ -1,6 +1,6 @@
 ﻿# pm-sysd-w 命名管道权限测试脚本 (手动运行).
 #
-# 需管理员运行; 需先编译二进制:
+# 需管理员运行. 需先编译二进制:
 #   cargo build --features cli_init
 #   cargo build --features cli_ctl
 #

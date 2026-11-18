@@ -62,11 +62,14 @@ pm_tc = 1
     assert_eq!(u.name, "test-run.service");
     assert_eq!(u.unit_type, UnitType::Service);
     assert_eq!(u.description, "Run a test program");
-    assert_eq!(u.service.exec_start, vec!["path/to/bin", "--arg"]);
+    assert_eq!(
+        u.service.exec_start,
+        vec![vec!["path/to/bin".to_string(), "--arg".to_string()]]
+    );
     assert_eq!(u.service.restart, RestartPolicy::Always);
     assert_eq!(u.service.restart_sec, 10);
     assert_eq!(u.service.service_type, ServiceType::Simple);
-    assert_eq!(u.install.wanted_by.as_deref(), Some("default.target"));
+    assert_eq!(u.install.wanted_by, vec!["default.target".to_string()]);
 }
 
 #[test]
@@ -87,9 +90,9 @@ fn defaults() {
     assert!(u.service.working_directory.is_none());
     assert!(u.service.environment.is_empty());
     assert!(!u.service.remain_after_exit);
-    assert!(u.service.exec_stop.is_none());
-    assert!(u.service.exec_reload.is_none());
-    assert!(u.install.wanted_by.is_none());
+    assert!(u.service.exec_stop.is_empty());
+    assert!(u.service.exec_reload.is_empty());
+    assert!(u.install.wanted_by.is_empty());
     assert!(!u.win.create_no_window);
     assert!(conf.db_path.ends_with("pm_sysd_w_v1.db"));
 }
@@ -179,14 +182,8 @@ pm_tc = 1
     let conf = load_conf(&path).unwrap();
     let u = &conf.units[0];
     assert_eq!(u.service.service_type, ServiceType::Oneshot);
-    assert_eq!(
-        u.service.exec_stop.as_deref(),
-        Some(&["stop".to_string()][..])
-    );
-    assert_eq!(
-        u.service.exec_reload.as_deref(),
-        Some(&["reload".to_string()][..])
-    );
+    assert_eq!(u.service.exec_stop, vec![vec!["stop".to_string()]]);
+    assert_eq!(u.service.exec_reload, vec![vec!["reload".to_string()]]);
     assert_eq!(u.service.restart, RestartPolicy::OnFailure);
     assert_eq!(u.service.restart_sec, 5);
     assert_eq!(u.service.timeout_start_sec, 10);
@@ -197,7 +194,7 @@ pm_tc = 1
         vec![("A".to_string(), "B".to_string())]
     );
     assert!(u.service.remain_after_exit);
-    assert_eq!(u.install.wanted_by.as_deref(), Some("default.target"));
+    assert_eq!(u.install.wanted_by, vec!["default.target".to_string()]);
 }
 
 #[test]
@@ -248,9 +245,15 @@ fn multiple_units() {
     let conf = load_conf(&path).unwrap();
     assert_eq!(conf.units.len(), 2);
     assert_eq!(conf.units[0].name, "a.service");
-    assert_eq!(conf.units[0].service.exec_start, vec!["bin-a"]);
+    assert_eq!(
+        conf.units[0].service.exec_start,
+        vec![vec!["bin-a".to_string()]]
+    );
     assert_eq!(conf.units[1].name, "b.service");
-    assert_eq!(conf.units[1].service.exec_start, vec!["bin-b"]);
+    assert_eq!(
+        conf.units[1].service.exec_start,
+        vec![vec!["bin-b".to_string()]]
+    );
 }
 
 #[test]
@@ -300,7 +303,226 @@ fn missing_exec_start() {
 "#,
     );
     let e = load_conf(&path).unwrap_err();
-    assert!(e.to_string().contains("Service.ExecStart"));
+    assert!(e.to_string().contains("ExecStart"));
+}
+
+#[test]
+fn exec_start_and_stop_both_empty() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "bad.service"
+"env:Service.ExecStart" = ""
+"env:Service.ExecStop" = ""
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("must not both be empty"));
+}
+
+#[test]
+fn simple_requires_exec_start() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "bad.service"
+"env:Service.Type" = "simple"
+"env:Service.ExecStop" = "stop"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("Type=simple requires ExecStart"));
+}
+
+#[test]
+fn missing_exec_start_requires_remain_after_exit() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "bad.service"
+"env:Service.Type" = "oneshot"
+"env:Service.ExecStop" = "stop"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("RemainAfterExit=yes"));
+}
+
+#[test]
+fn oneshot_exec_stop_only_with_remain_after_exit() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.Type" = "oneshot"
+"env:Service.ExecStop" = "stop"
+"env:Service.RemainAfterExit" = "yes"
+"#,
+    );
+    let conf = load_conf(&path).unwrap();
+    assert!(conf.units[0].service.exec_start.is_empty());
+    assert_eq!(
+        conf.units[0].service.exec_stop,
+        vec![vec!["stop".to_string()]]
+    );
+    assert!(conf.units[0].service.remain_after_exit);
+}
+
+#[test]
+fn multi_line_exec_commands() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin-a --x"
+"env:Service.ExecStart.1" = "bin-b"
+"env:Service.ExecStop.2" = "stop-b"
+"env:Service.ExecStop.1" = "stop-a"
+"#,
+    );
+    let conf = load_conf(&path).unwrap();
+    let s = &conf.units[0].service;
+    assert_eq!(
+        s.exec_start,
+        vec![
+            vec!["bin-a".to_string(), "--x".to_string()],
+            vec!["bin-b".to_string()],
+        ]
+    );
+    assert_eq!(
+        s.exec_stop,
+        vec![vec!["stop-a".to_string()], vec!["stop-b".to_string()]]
+    );
+    // 多行 key 不再产生不支持警告
+    assert!(
+        !conf
+            .warnings
+            .iter()
+            .any(|w| w.contains("ExecStart.1") || w.contains("ExecStop.1"))
+    );
+}
+
+#[test]
+fn multi_line_exec_empty_clears_previous() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin-a"
+"env:Service.ExecStart.1" = ""
+"env:Service.ExecStart.2" = "bin-b"
+"#,
+    );
+    let conf = load_conf(&path).unwrap();
+    assert_eq!(
+        conf.units[0].service.exec_start,
+        vec![vec!["bin-b".to_string()]]
+    );
+}
+
+#[test]
+fn multi_line_environment() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Service.Environment" = "A=B"
+"env:Service.Environment.1" = "C=D"
+"#,
+    );
+    let conf = load_conf(&path).unwrap();
+    assert_eq!(
+        conf.units[0].service.environment,
+        vec![
+            ("A".to_string(), "B".to_string()),
+            ("C".to_string(), "D".to_string())
+        ]
+    );
+}
+
+#[test]
+fn multi_line_environment_empty_clears_previous() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Service.Environment" = "A=B"
+"env:Service.Environment.1" = ""
+"env:Service.Environment.2" = "C=D"
+"#,
+    );
+    let conf = load_conf(&path).unwrap();
+    assert_eq!(
+        conf.units[0].service.environment,
+        vec![("C".to_string(), "D".to_string())]
+    );
+}
+
+#[test]
+fn multi_line_wanted_by_dedup() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Install.WantedBy" = "default.target"
+"env:Install.WantedBy.1" = "x.target"
+"env:Install.WantedBy.2" = "default.target"
+"#,
+    );
+    let conf = load_conf(&path).unwrap();
+    assert_eq!(
+        conf.units[0].install.wanted_by,
+        vec!["default.target".to_string(), "x.target".to_string()]
+    );
+    assert_eq!(conf.warnings.len(), 1);
+    assert!(conf.warnings[0].contains("duplicate Install.WantedBy"));
+    assert!(conf.warnings[0].contains("default.target"));
+}
+
+#[test]
+fn multi_line_empty_suffix_error() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"env:Service.ExecStart." = "bad"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("empty suffix"));
 }
 
 #[test]
@@ -317,6 +539,94 @@ fn unit_name_must_end_with_service() {
     );
     let e = load_conf(&path).unwrap_err();
     assert!(e.to_string().contains(".service"));
+}
+
+#[test]
+fn unit_name_check_name() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a b.service"
+"env:Service.ExecStart" = "bin"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("invalid unit name"));
+}
+
+#[test]
+fn unit_name_nfkc() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "①.service"
+"env:Service.ExecStart" = "bin"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("invalid unit name"));
+}
+
+#[test]
+fn unit_name_too_long() {
+    let dir = TempDir::new("conf");
+    let name = format!("{}.service", "a".repeat(500));
+    let path = write_conf(
+        &dir,
+        &format!(
+            r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "{}"
+"env:Service.ExecStart" = "bin"
+"#,
+            name
+        ),
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("exceeds 500 bytes"));
+}
+
+#[test]
+fn unit_name_exact_limit_ok() {
+    let dir = TempDir::new("conf");
+    let name = format!("{}.service", "a".repeat(492));
+    let path = write_conf(
+        &dir,
+        &format!(
+            r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "{}"
+"env:Service.ExecStart" = "bin"
+"#,
+            name
+        ),
+    );
+    let conf = load_conf(&path).unwrap();
+    assert_eq!(conf.units[0].name.len(), 500);
+}
+
+#[test]
+fn unit_name_dot_service_empty() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(
+        &dir,
+        r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = ".service"
+"env:Service.ExecStart" = "bin"
+"#,
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("must not be empty"));
 }
 
 #[test]
@@ -568,4 +878,53 @@ fn unsupported_key_warnings() {
     }
     // 其余前缀的 key 静默忽略, 不产生警告.
     assert!(!warnings.iter().any(|w| w.contains("Other.Key")));
+}
+
+#[test]
+fn unit_value_too_large() {
+    let dir = TempDir::new("conf");
+    let value = "a".repeat(20 * 1024 + 1);
+    let path = write_conf(
+        &dir,
+        &format!(
+            r#"pm_tc = 1
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "{}"
+"#,
+            value
+        ),
+    );
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("exceeds 20480 bytes"));
+}
+
+#[test]
+fn conf_total_size_limit() {
+    use pm_tc::conf::ReadConfFile;
+
+    let dir = TempDir::new("conf");
+    let path = dir.path().join("a.toml");
+    std::fs::write(&path, "12345").unwrap();
+    let p = path.to_string_lossy().into_owned();
+
+    let mut r = super::FsReader { total: 0, limit: 4 };
+    let e = r.read(&p).unwrap_err();
+    assert!(e.to_string().contains("total size"));
+}
+
+#[test]
+fn conf_total_size_exact_ok() {
+    use pm_tc::conf::ReadConfFile;
+
+    let dir = TempDir::new("conf");
+    let path = dir.path().join("a.toml");
+    std::fs::write(&path, "1234").unwrap();
+    let p = path.to_string_lossy().into_owned();
+
+    let mut r = super::FsReader { total: 0, limit: 4 };
+    let text = r.read(&p).unwrap();
+    assert_eq!(text, "1234");
+    assert_eq!(r.total, 4);
 }

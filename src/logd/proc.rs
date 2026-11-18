@@ -1,9 +1,9 @@
 //! 子进程 stdout/stderr 采集.
 
-use std::str;
-
 use log::warn;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+
+use crate::pa::TextDecoder;
 
 use super::{Logd, MAX_LOG_LEN};
 
@@ -20,6 +20,7 @@ impl Logd {
         let level = level.to_string();
         tokio::spawn(async move {
             let mut reader = BufReader::new(reader);
+            let mut decoder = TextDecoder::new();
             loop {
                 let (mut buf, ended) = match read_log_chunk(&mut reader, MAX_LOG_LEN).await {
                     // 读到 EOF: 管道关闭 (子进程退出), 结束本任务.
@@ -36,24 +37,43 @@ impl Logd {
                         buf.pop();
                     }
                 }
-                match str::from_utf8(&buf) {
-                    // 超长行由 logd 自动拆分为多条日志
-                    Ok(s) => {
-                        logd.write_with(&level, Some(&name), s)
-                            .expect("write subprocess output log");
-                    }
-                    // 非 UTF-8 输出: 换成一条 error 日志, 写入对应 unit.
-                    Err(_) => {
+
+                let msg = match decoder.decode(&buf) {
+                    Ok(s) => s,
+                    // 解码失败 (Windows ACP 模式失败): 换成一条 error 日志.
+                    Err(e) => {
                         logd.write_with(
                             "error",
                             Some(&name),
-                            &format!(
-                                "subprocess {} output is not utf-8; replaced with this error",
-                                level
-                            ),
+                            &format!("subprocess {} output decode failed: {}", level, e),
                         )
-                        .expect("write subprocess non-utf-8 log");
+                        .expect("write subprocess decode error log");
+                        continue;
                     }
+                };
+
+                // 完整行 (含空行) 或非空解码结果才写入日志.
+                if ended || !msg.is_empty() {
+                    logd.write_with(&level, Some(&name), &msg)
+                        .expect("write subprocess output log");
+                }
+            }
+
+            // EOF: 解码器内部可能残留未构成完整字符的字节.
+            match decoder.finish() {
+                Ok(s) => {
+                    if !s.is_empty() {
+                        logd.write_with(&level, Some(&name), &s)
+                            .expect("write subprocess output log");
+                    }
+                }
+                Err(e) => {
+                    logd.write_with(
+                        "error",
+                        Some(&name),
+                        &format!("subprocess {} output decode failed at eof: {}", level, e),
+                    )
+                    .expect("write subprocess decode error log");
                 }
             }
         });

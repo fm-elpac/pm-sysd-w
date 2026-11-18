@@ -19,6 +19,7 @@
 
 mod error;
 mod hello;
+mod log;
 mod req;
 mod res;
 mod util;
@@ -31,12 +32,13 @@ pub use hello::{
     Hello, HelloData, PROTOCOL_VERSION, VERSION, VersionMismatch, check_version, decode_hello,
     encode_hello,
 };
+pub use log::{SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdResLogItem, SdResLogPage};
 pub use req::{
-    SdReq, SdReqLogQuery, SdReqLogRO, SdReqSysd, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO,
+    SdReq, SdReqPagePos, SdReqSysd, SdReqUnit, SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO,
     SdReqUnitRO, SdReqUnitd, SdReqUnitdRO,
 };
 pub use res::{
-    SdRes, SdResLogEntry, SdResServiceStatus, SdResTimerInfo, SdResTimerStatus, SdResUnitS,
+    SdRes, SdResPage, SdResServiceStatus, SdResTimerInfo, SdResTimerStatus, SdResUnitS,
     SdResUnitState, SdResUnitStatus,
 };
 pub use util::{decode_frame, encode_frame};
