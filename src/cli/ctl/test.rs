@@ -2,10 +2,10 @@
 
 use crate::{
     cli::resolve_instance_with,
-    jsonl::{SdReq, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd},
+    jsonl::{SdReq, SdReqUnit, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd, SdReqWhoami},
 };
 
-use super::{Instance, build_command, parse_args};
+use super::{Instance, build_command, build_whoami, parse_args};
 
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -39,6 +39,35 @@ fn parse_args_now() {
     assert_eq!(a.command, "enable");
     assert!(a.now);
     assert_eq!(a.units, vec!["a.service"]);
+}
+
+#[test]
+fn parse_args_json() {
+    let a = parse_args(&s(&["whoami", "--json"])).unwrap();
+    assert_eq!(a.command, "whoami");
+    assert!(a.json);
+}
+
+#[test]
+fn build_whoami_no_pid() {
+    let c = build_whoami(&[]).unwrap();
+    assert!(matches!(c, SdReq::Whoami(SdReqWhoami { pid: None })));
+}
+
+#[test]
+fn build_whoami_pid() {
+    let c = build_whoami(&s(&["42"])).unwrap();
+    assert!(matches!(c, SdReq::Whoami(SdReqWhoami { pid: Some(42) })));
+}
+
+#[test]
+fn build_whoami_invalid_pid() {
+    assert!(build_whoami(&s(&["abc"])).is_err());
+}
+
+#[test]
+fn build_whoami_too_many() {
+    assert!(build_whoami(&s(&["1", "2"])).is_err());
 }
 
 #[test]

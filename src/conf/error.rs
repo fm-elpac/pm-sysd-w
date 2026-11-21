@@ -2,13 +2,15 @@
 
 use std::{error::Error, fmt};
 
-/// conf 模块错误.
+/// conf 模块错误
 #[derive(Debug, Clone)]
 pub enum ConfError {
     /// pm-tc 配置解析 / 计划 错误
     Pm(String),
     /// unit 配置 错误
     BadUnit(String),
+    /// `[env]` 配置 错误
+    BadEnv(String),
     /// 通用错误 (携带消息)
     Msg(String),
 }
@@ -20,6 +22,7 @@ impl fmt::Display for ConfError {
         match self {
             Self::Pm(m) => write!(f, "conf: {}", m),
             Self::BadUnit(m) => write!(f, "conf: {}", m),
+            Self::BadEnv(m) => write!(f, "conf: {}", m),
             Self::Msg(m) => write!(f, "{}", m),
         }
     }

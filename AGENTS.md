@@ -14,11 +14,12 @@ deno fmt
 
 cargo build
 
+# 测试时使用 `--all-features`
 cargo test --all-features
 
 cargo doc
 
-# release 应分别编译 3 个 bin
+# release 应分别编译 3 个 bin, 不应使用 `--all-features`
 cargo build --release --features cli_init
 cargo build --release --features cli_ctl
 cargo build --release --features cli_log
@@ -45,7 +46,7 @@ cargo build --release --features cli_log
 - 禁止 `unsafe` 代码 (`#![deny(unsafe_code)]`). 必须使用时只能放在明确允许的
   少数模块内, 且模块内代码尽量少 (能 safe 的代码不应放进来).
 
-- 例外: `p_w::console`, `p_w::acl`, `p_w::acp`, `p_w::service`.
+- 例外: `p_w::acl`, `p_w::acp`, `p_w::console`, `p_w::service::u`.
 
   这些 Windows API 无安全替代, 必须调用 `unsafe fn`.
 
@@ -74,6 +75,9 @@ cargo build --release --features cli_log
 
 - 测试代码 (rust) 应全部放到相应 `test.rs` 中, 不应有内联测试代码.
 
+- 手动测试脚本放在 `test/` 目录, 说明见 `test/README.md`
+  (例如日志写入压力测试脚本 `test/log/stress.js`).
+
 ## 文档约定
 
 - 中文文档为准, 英文翻译由 AI 自动同步.
@@ -83,7 +87,25 @@ cargo build --release --features cli_log
 - 项目入口 `README.md` 采用中英混写: 一段中文后紧跟一段对应英文翻译.
 - 修改代码或配置格式时, 同步更新对应文档.
 
-## 关于 win10 测试机
+---
+
+- **开发文档** 是更高层级的设计 / 需求 / 总览, 不应重复代码注释或代码 (实现)
+  本身. "一眼就能看出来" 的内容不应写入文档. 代码注释负责具体的底层细节.
+
+### 文档风格
+
+- 不要在汉字之间 `换行`, 只能在标点符号前/后换行. 不要使用分号 `;`, 使用逗号
+  (`,`) 或句号 (`.`).
+
+- 表格的行不要太长 (内容不要太多). 如果内容太多, 改成 `列表` 形式,
+  或者在表格下方添加补充说明.
+
+## 开发环境与辅助资料
+
+此处描述的是 pm-sysd-w 的 "内部" 开发环境. 由于本项目开源发布,
+实际开发环境可能与此不同.
+
+### win10 测试机
 
 如果开发环境中存在 `~/dev-vm/` 目录, 需要使用 win10 测试机时, 去阅读其中的文档
 (有相关说明).
@@ -92,7 +114,7 @@ cargo build --release --features cli_log
 
 若此目录不存在, 则是另外的开发环境, 可能没有 win10 测试机.
 
-## 关于 systemd 源码
+### systemd 源码
 
 如果本项目的 `tmp/systemd/` 目录存在, 此处有一份准备好的 systemd 源码,
 需要时可参考.

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     conf::{Unit, UnitType},
-    sysu::{EnableSta, LoadSta, UnitSta, UnitSubSta},
+    sysu::{DaemonSta, EnableSta, LoadSta, UnitSta, UnitSubSta},
 };
 
 use super::SdResLogPage;
@@ -35,6 +35,10 @@ pub enum SdRes {
     Status(SdResUnitStatus),
     /// `get-default`
     DefaultTarget(String),
+    /// `is-system-running`
+    SystemState(DaemonSta),
+    /// `whoami`
+    Whoami(SdResWhoami),
 }
 
 /// 分页查询结果 (通用)
@@ -72,6 +76,34 @@ pub struct SdResUnitState {
     pub load: LoadSta,
     /// 启用状态
     pub enable: EnableSta,
+}
+
+/// `whoami` 查询结果.
+///
+/// pid 查询命中 service 时填 `service`; 查询 init 自身时填 `init`.
+/// 二者必有且仅有一个为 `Some`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdResWhoami {
+    /// 命中的 service 名称 (pid 查询)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// init 自身信息 (无 pid 查询)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<SdResWhoamiInit>,
+}
+
+/// pm-sysd-init 自身信息 (供 `whoami` 返回)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdResWhoamiInit {
+    /// 实例类型: `system` / `user` / `machine`
+    pub instance_type: String,
+    /// 实例名称: user 名, 或 `--machine` 指定的名称 (system 实例为空)
+    pub instance_name: String,
+    /// pm-sysd-init 进程 pid
+    pub pid: u32,
+    /// Windows 服务名 (仅当 pm-sysd-init 作为 Windows 服务运行时)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 /// `list-timers` 分页查询结果

@@ -14,15 +14,14 @@ use crate::{
     conf::{Unit, UnitType},
     jsonl::{
         SdRes, SdResPage, SdResServiceStatus, SdResUnitS, SdResUnitState, SdResUnitStatus,
-        encode_frame,
+        SdResWhoami, encode_frame,
     },
-    pa::MAX_MESSAGE_LEN,
     sysd::{
         send_reply,
         service_d::{ServiceD, ServiceDM},
         service_s::ServiceStatusInfo,
     },
-    sysu::{EnableSta, LoadSta, ServiceSta, TargetSta, UnitSta, UnitSubSta},
+    sysu::{DaemonSta, EnableSta, LoadSta, ServiceSta, TargetSta, UnitSta, UnitSubSta},
 };
 
 /// UnitD 侧的一个 unit 快照 (只读)
@@ -66,10 +65,22 @@ pub enum QueryKind {
         name: String,
         info: Option<UnitInfo>,
     },
+    /// is-system-running
+    SystemState {
+        /// 当前配置中的 unit 快照 (未 mask)
+        infos: Vec<UnitInfo>,
+        /// 已 mask 的 unit 名称
+        masked: Vec<String>,
+    },
+    /// whoami (按 pid 查运行中 service)
+    Whoami {
+        /// 要查询的 pid
+        pid: u32,
+    },
 }
 
 /// 执行查询 (在 async task 中), 返回响应 (由 UnitD 发送)
-pub fn spawn_query(req: QueryReq, sd: ServiceD, tx: oneshot::Sender<SdRes>) {
+pub fn spawn_query(req: QueryReq, sd: ServiceD, tx: oneshot::Sender<SdRes>, ipc_m_byte: usize) {
     tokio::spawn(async move {
         let r = match req.kind {
             QueryKind::ListUnits {
@@ -78,9 +89,22 @@ pub fn spawn_query(req: QueryReq, sd: ServiceD, tx: oneshot::Sender<SdRes>) {
                 limit,
                 cursor,
                 masked,
-            } => list_units(&target, infos, limit, cursor.as_deref(), &masked, &sd).await,
+            } => {
+                list_units(
+                    &target,
+                    infos,
+                    limit,
+                    cursor.as_deref(),
+                    &masked,
+                    &sd,
+                    ipc_m_byte,
+                )
+                .await
+            }
             QueryKind::UnitState { name, info } => unit_state(&name, info, &sd).await,
             QueryKind::Status { name, info } => status(&name, info, &sd).await,
+            QueryKind::SystemState { infos, masked } => system_state(&sd, infos, &masked).await,
+            QueryKind::Whoami { pid } => whoami(pid, &sd).await,
         };
         send_reply(tx, r);
     });
@@ -152,6 +176,7 @@ async fn list_units(
     cursor: Option<&str>,
     masked: &[String],
     sd: &ServiceD,
+    ipc_m_byte: usize,
 ) -> SdRes {
     let masked: HashSet<&str> = masked.iter().map(String::as_str).collect();
 
@@ -257,7 +282,7 @@ async fn list_units(
             Ok(line) => line,
             Err(e) => return SdRes::Err(e.to_string()),
         };
-        if units.len() <= 1 || line.len() <= MAX_MESSAGE_LEN {
+        if units.len() <= 1 || line.len() <= ipc_m_byte {
             return resp;
         }
         units.truncate(units.len() / 2);
@@ -406,5 +431,59 @@ async fn status(name: &str, info: Option<UnitInfo>, sd: &ServiceD) -> SdRes {
             restart_count: st.restart_count,
             exit_status: st.exit_status,
         }),
+    })
+}
+
+/// whoami: 按 pid 反查运行中 service 名称.
+async fn whoami(pid: u32, sd: &ServiceD) -> SdRes {
+    let (reply, rx) = oneshot::channel();
+    if sd.send(ServiceDM::QueryPid { pid, reply }).await.is_err() {
+        return SdRes::Err("ServiceD stopped".to_string());
+    }
+    match rx.await {
+        Ok(Some(name)) => SdRes::Whoami(SdResWhoami {
+            service: Some(name),
+            init: None,
+        }),
+        Ok(None) => SdRes::Err(format!(
+            "PID {} does not belong to any running service.",
+            pid
+        )),
+        Err(_) => SdRes::Err("ServiceD stopped".to_string()),
+    }
+}
+
+/// is-system-running: 组合当前配置与 ServiceD 运行状态, 计算整个实例的运行状态.
+///
+/// 本项目没有 basic.target / job 队列 / rescue target, 因此只区分:
+/// `running` (正常) / `degraded` (存在 failed unit) / `unknown` (查询失败).
+/// `stopping` 由 UnitD 在进入退出状态时直接回复, 不在本查询中计算.
+async fn system_state(sd: &ServiceD, infos: Vec<UnitInfo>, masked: &[String]) -> SdRes {
+    // 查询范围: 当前配置中的 unit, 已 mask 但仍可能运行的 unit, 以及已从配置
+    // 移除但仍运行的旧配置 service.
+    let mut names: Vec<String> = infos.iter().map(|i| i.name.clone()).collect();
+    names.extend(masked.iter().cloned());
+
+    let running = match query_running_units(sd).await {
+        Ok(v) => v,
+        Err(_) => return SdRes::SystemState(DaemonSta::Unknown),
+    };
+    for (name, _) in running {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    let states = match query_states(sd, names).await {
+        Ok(s) => s,
+        Err(_) => return SdRes::SystemState(DaemonSta::Unknown),
+    };
+    let degraded = states
+        .iter()
+        .any(|(_, active, _)| *active == UnitSta::Failed);
+    SdRes::SystemState(if degraded {
+        DaemonSta::Degraded
+    } else {
+        DaemonSta::Running
     })
 }

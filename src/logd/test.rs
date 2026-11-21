@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{db::DbClient, jsonl::SdReqPagePos, test::TempDir};
+use crate::{conf::limit::SysdLimit, db::DbClient, jsonl::SdReqPagePos, test::TempDir};
 
 use super::{Logd, proc::read_log_chunk, split_msg, warn::RateLimitState};
 
@@ -14,8 +14,8 @@ fn tmp_db(dir: &TempDir) -> String {
 async fn write_and_page_entries() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let mut logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let mut logd = Logd::new(db, &SysdLimit::default());
 
     logd.write("hello").unwrap();
     logd.write_with("error", Some("a.service"), "boom").unwrap();
@@ -89,8 +89,8 @@ async fn read_log_chunk_caps_buffer() {
 async fn page_entries_pagination() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let logd = Logd::new(db, &SysdLimit::default());
 
     for i in 0..5 {
         logd.write_with("info", None, &format!("m{}", i)).unwrap();
@@ -133,8 +133,8 @@ async fn page_entries_pagination() {
 async fn page_entries_end_asc_position() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let logd = Logd::new(db, &SysdLimit::default());
 
     for i in 0..5 {
         logd.write_with("info", None, &format!("m{}", i)).unwrap();
@@ -159,8 +159,8 @@ async fn page_entries_end_asc_position() {
 async fn page_entries_end_asc_skip_larger_than_total() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let logd = Logd::new(db, &SysdLimit::default());
 
     for i in 0..3 {
         logd.write_with("info", None, &format!("m{}", i)).unwrap();
@@ -183,8 +183,8 @@ async fn page_entries_end_asc_skip_larger_than_total() {
 async fn page_entries_start_asc_position() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let logd = Logd::new(db, &SysdLimit::default());
 
     for i in 0..5 {
         logd.write_with("info", None, &format!("m{}", i)).unwrap();
@@ -207,8 +207,8 @@ async fn page_entries_start_asc_position() {
 async fn page_entries_start_desc_position() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let logd = Logd::new(db, &SysdLimit::default());
 
     for i in 0..5 {
         logd.write_with("info", None, &format!("m{}", i)).unwrap();
@@ -232,8 +232,8 @@ async fn page_entries_start_desc_position() {
 async fn page_entries_end_desc() {
     let dir = TempDir::new("logd");
     let path = tmp_db(&dir);
-    let db = DbClient::open(&path).unwrap();
-    let logd = Logd::new(db);
+    let db = DbClient::open(&path, &SysdLimit::default()).unwrap();
+    let logd = Logd::new(db, &SysdLimit::default());
 
     for i in 0..5 {
         logd.write_with("info", None, &format!("m{}", i)).unwrap();
@@ -259,14 +259,34 @@ fn warn_rate_limit_per_key() {
     let t0 = Instant::now();
 
     // 不同 key 独立限速, 不会互相饿死
-    assert!(st.process("a", "a", t0));
-    assert!(st.process("b", "b", t0));
+    assert!(st.process("a", "a", t0, Duration::from_secs(1)));
+    assert!(st.process("b", "b", t0, Duration::from_secs(1)));
     // 同一 key 在限速窗口内被抑制
-    assert!(!st.process("a", "a", t0 + Duration::from_millis(100)));
-    assert!(!st.process("b", "b", t0 + Duration::from_millis(100)));
+    assert!(!st.process(
+        "a",
+        "a",
+        t0 + Duration::from_millis(100),
+        Duration::from_secs(1)
+    ));
+    assert!(!st.process(
+        "b",
+        "b",
+        t0 + Duration::from_millis(100),
+        Duration::from_secs(1)
+    ));
     // 超过限速间隔后可再次输出
-    assert!(st.process("a", "a", t0 + Duration::from_secs(1)));
-    assert!(st.process("b", "b", t0 + Duration::from_secs(1)));
+    assert!(st.process(
+        "a",
+        "a",
+        t0 + Duration::from_secs(1),
+        Duration::from_secs(1)
+    ));
+    assert!(st.process(
+        "b",
+        "b",
+        t0 + Duration::from_secs(1),
+        Duration::from_secs(1)
+    ));
 }
 
 #[test]
@@ -275,16 +295,26 @@ fn warn_rate_limit_cleanup() {
     let t0 = Instant::now();
 
     // 首次调用: 插入 a, 并触发第一次清理 (记录 last_cleanup = t0)
-    assert!(st.process("a", "a", t0));
+    assert!(st.process("a", "a", t0, Duration::from_secs(1)));
     assert_eq!(st.keys.len(), 1);
 
     // 1 秒后插入 b: 距上次清理 1 秒, 清理动作本身被限速, 不触发清理
-    assert!(st.process("b", "b", t0 + Duration::from_secs(1)));
+    assert!(st.process(
+        "b",
+        "b",
+        t0 + Duration::from_secs(1),
+        Duration::from_secs(1)
+    ));
     assert_eq!(st.keys.len(), 2);
 
     // 3 秒后调用 a: 距上次清理 3 秒, 超过 2 倍限速间隔, 触发清理.
     // a 本次输出更新了自己的时间, 被保留; b 超过 1 倍间隔未输出, 被丢弃
-    assert!(st.process("a", "a", t0 + Duration::from_secs(3)));
+    assert!(st.process(
+        "a",
+        "a",
+        t0 + Duration::from_secs(3),
+        Duration::from_secs(1)
+    ));
     assert_eq!(st.keys.len(), 1);
     assert!(st.keys.contains_key("a"));
     assert!(!st.keys.contains_key("b"));

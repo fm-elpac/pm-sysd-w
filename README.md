@@ -20,6 +20,14 @@ pm-sysd-w mimics the style and user experience of systemd, managing processes on
 Windows. It is not systemd-compatible and implements only a small subset of
 systemd. Configuration uses pm-tc's centralized TOML format.
 
+---
+
+镜像 (mirror):
+
+- <https://bitbucket.org/fm-elpac/pm-sysd-w/>
+- <https://gitea.com/fm-elpac/pm-sysd-w>
+- <https://gitlink.org.cn/fm-elpac/pm-sysd-w>
+
 ## 举栗 Example
 
 比如, 配置文件 `test.conf.toml`:
@@ -104,12 +112,10 @@ cargo build --release --features cli_log
 
 ## 文档 Documentation
 
-用户文档见 `doc/user/`(中文) / `doc/user_en/`(英文翻译). 开发文档见
-`doc/dev/`(中文) / `doc/dev_en/`(英文翻译). 以中文文档为准.
+用户文档见 `doc/user/`(中文). 开发文档见 `doc/dev/`(中文). 以中文文档为准.
 
-User docs are in `doc/user/` (Chinese) / `doc/user_en/` (English translation).
-Development docs are in `doc/dev/` (Chinese) / `doc/dev_en/` (English
-translation). The Chinese docs are authoritative.
+User docs are in `doc/user_en/` (English translation). Development docs are in
+`doc/dev_en/` (English translation). The Chinese docs are authoritative.
 
 ## LICENSE
 

@@ -4,6 +4,11 @@
 #
 pm_tc = 1
 
+# (可选) pm-sysd-w 自身配置:
+# [env]
+# SYSD_DB = "pm_sysd_w_v1.db"
+# SYSD_DB_LOG_NO_INDEX = "1"
+
 # 一个 unit (service): test-run.service
 [[t.sysd]]
 "env:Unit" = "test-run.service"

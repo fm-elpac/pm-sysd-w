@@ -20,7 +20,7 @@ use crate::{
         SdResPage,
     },
     sysd::{SysdError, TARGET_DEFAULT, TARGET_EXIT, reload::ReloadR, service_d::ServiceCmdUnit},
-    sysu::{EnableSta, LoadSta},
+    sysu::{DaemonSta, EnableSta, LoadSta},
 };
 
 use super::{
@@ -260,6 +260,13 @@ impl Sm {
             SdReq::UnitD(r) => self.handle_unitd(r),
             SdReq::UnitRO(r) => self.handle_unit_ro(r),
             SdReq::Unit(r) => self.handle_unit(r),
+            SdReq::Whoami(w) => match w.pid {
+                Some(pid) => vec![SmOutput::QueryService(QueryReq {
+                    kind: QueryKind::Whoami { pid },
+                })],
+                // 无 pid 的 whoami 由 SysD 直接回复, 不应到达 UnitD.
+                None => vec![res_err("whoami without pid")],
+            },
             // 不支持其余请求
             _ => {
                 vec![res_err("unsupported request")]
@@ -289,6 +296,18 @@ impl Sm {
                 cursor: None,
                 list: vec![],
             }))],
+            SdReqUnitdRO::SystemState => {
+                if self.exiting {
+                    vec![SmOutput::Reply(SdRes::SystemState(DaemonSta::Stopping))]
+                } else {
+                    vec![SmOutput::QueryService(QueryReq {
+                        kind: QueryKind::SystemState {
+                            infos: self.units.all_infos(),
+                            masked: self.units.masked_names(),
+                        },
+                    })]
+                }
+            }
             SdReqUnitdRO::ShowEnvironment => vec![res_err("TODO")],
         }
     }

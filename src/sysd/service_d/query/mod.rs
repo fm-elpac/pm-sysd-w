@@ -87,6 +87,35 @@ pub fn spawn_query_states(
     });
 }
 
+/// 按 pid 反查运行中 service 名称.
+///
+/// 遍历所有活跃 ServiceS 句柄并查询其详细状态, 找到 `pid` 匹配的 service 后
+/// 立即回复其名称; 全部未命中则回复 `None`.
+pub fn spawn_query_pid(
+    handles: Vec<(String, ServiceS)>,
+    pid: u32,
+    reply: oneshot::Sender<Option<String>>,
+) {
+    tokio::spawn(async move {
+        for (name, h) in handles {
+            let (tx, rx) = oneshot::channel();
+            // 单个 service 查询失败视为未命中 (与其它查询命令相同的尽力而为语义).
+            if h.send(ServiceSM::QueryStatus(tx)).await.is_err() {
+                continue;
+            }
+            let info = match rx.await {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+            if info.pid == Some(pid) {
+                send_reply(reply, Some(name));
+                return;
+            }
+        }
+        send_reply(reply, None);
+    });
+}
+
 /// 由终止状态推导 active / sub 状态 (无活跃 ServiceS 时)
 pub fn active_sub_of(last: Option<&ServiceStatus>) -> (UnitSta, ServiceSta) {
     match last {

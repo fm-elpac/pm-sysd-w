@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use crate::{
     jsonl::{
         SdReq, SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdReqPagePos, SdReqSysd,
-        SdReqUnitList, SdReqUnitOpRO, SdReqUnitdRO, SdRes,
+        SdReqUnitList, SdReqUnitOpRO, SdReqUnitdRO, SdReqWhoami, SdRes, SdResWhoami,
     },
     sysd::{SysDM, init::Shutdown, test_util::*},
     sysu::{EnableSta, LoadSta, UnitSta},
@@ -23,7 +23,7 @@ async fn exit_notifies_shutdown() {
     svc_start(&sysd, "b.service").await.unwrap();
     let resp = handle(&sysd, &SdReq::SysD(SdReqSysd::Exit)).await;
     assert!(matches!(resp, SdRes::Ok(_)));
-    assert!(matches!(exit_rx.await, Ok(Shutdown::Exit)));
+    assert!(matches!(exit_rx.await, Ok(Ok(Shutdown::Exit))));
 }
 
 #[tokio::test]
@@ -38,7 +38,7 @@ async fn soft_reboot_notifies_shutdown() {
     svc_start(&sysd, "b.service").await.unwrap();
     let resp = handle(&sysd, &SdReq::SysD(SdReqSysd::SoftReboot)).await;
     assert!(matches!(resp, SdRes::Ok(_)));
-    assert!(matches!(exit_rx.await, Ok(Shutdown::SoftReboot)));
+    assert!(matches!(exit_rx.await, Ok(Ok(Shutdown::SoftReboot))));
 }
 
 #[tokio::test]
@@ -125,6 +125,59 @@ async fn handle_dispatch() {
             assert_eq!(s.enable, EnableSta::Enabled);
             assert_eq!(s.load, LoadSta::Loaded);
         }
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn whoami_self_info() {
+    let (sysd, _logd, _dir) = make_sysd(&unit_conf(&run_cmd(), ""));
+
+    let resp = handle(&sysd, &SdReq::Whoami(SdReqWhoami { pid: None })).await;
+    match resp {
+        SdRes::Whoami(SdResWhoami {
+            service: None,
+            init: Some(init),
+        }) => {
+            assert_eq!(init.instance_type, "machine");
+            assert_eq!(init.pid, std::process::id());
+            assert_eq!(init.service_name, None);
+        }
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn whoami_pid_matches_running_service() {
+    let (sysd, _logd, _dir) = make_sysd(&unit_conf(&run_cmd(), ""));
+    svc_start(&sysd, "t.service").await.unwrap();
+
+    let st = status(&sysd, "t.service").await.unwrap();
+    let pid = service_status(&st).pid.expect("running service has pid");
+
+    let resp = handle(&sysd, &SdReq::Whoami(SdReqWhoami { pid: Some(pid) })).await;
+    match resp {
+        SdRes::Whoami(SdResWhoami {
+            service: Some(name),
+            init: None,
+        }) => assert_eq!(name, "t.service"),
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn whoami_pid_not_found() {
+    let (sysd, _logd, _dir) = make_sysd(&unit_conf(&run_cmd(), ""));
+
+    let resp = handle(
+        &sysd,
+        &SdReq::Whoami(SdReqWhoami {
+            pid: Some(99_999_999),
+        }),
+    )
+    .await;
+    match resp {
+        SdRes::Err(msg) => assert!(msg.contains("does not belong")),
         other => panic!("unexpected response: {:?}", other),
     }
 }

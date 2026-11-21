@@ -105,12 +105,18 @@ fn sm_start_many_mixes_active_and_new() {
         ("a.service".to_string(), service_unit("a.service")),
         ("b.service".to_string(), service_unit("b.service")),
     ]));
-    assert_eq!(out.len(), 3);
+    assert_eq!(out.len(), 2);
     assert!(
         matches!(&out[0], SmOutput::SendServiceS { name, op: ServiceOp::Start } if name == "a.service")
     );
     assert!(matches!(&out[1], SmOutput::StartService { name, .. } if name == "b.service"));
-    assert!(matches!(&out[2], SmOutput::ReplyResult(Ok(()))));
+}
+
+#[test]
+fn sm_start_many_done_replies_result() {
+    let (_, out) = Sm::new().t(SmInput::StartManyDone(Ok(())));
+    assert_eq!(out.len(), 1);
+    assert!(matches!(&out[0], SmOutput::ReplyResult(Ok(()))));
 }
 
 #[test]

@@ -12,6 +12,7 @@ pub mod init;
 pub mod reload;
 
 mod error;
+mod server;
 mod service_d;
 mod service_s;
 mod sys_d;
@@ -24,6 +25,7 @@ mod util;
 mod test_util;
 
 pub use error::SysdError;
+pub use server::{Server, ServerSender, Shutdown};
 pub use sys_d::{SysD, SysDM};
 pub use util::send_reply;
 

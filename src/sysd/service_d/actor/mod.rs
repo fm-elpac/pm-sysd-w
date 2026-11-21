@@ -55,11 +55,15 @@ pub struct ServiceD {
 
 impl ServiceD {
     /// 启动 ServiceD actor, 返回句柄
-    pub fn spawn(logd: Logd) -> Self {
-        let (tx, rx) = mpsc::channel(64);
+    pub fn spawn(logd: Logd, channel_capacity_n: usize) -> Self {
+        let (tx, rx) = mpsc::channel(channel_capacity_n);
         let self_tx = tx.clone();
 
-        tokio::spawn(async move { Actor::new(rx, self_tx, logd).run().await });
+        tokio::spawn(async move {
+            Actor::new(rx, self_tx, logd, channel_capacity_n)
+                .run()
+                .await
+        });
 
         Self { tx }
     }
@@ -101,6 +105,8 @@ pub struct Actor {
     tx: mpsc::Sender<M>,
     /// Logd 句柄 (创建 ServiceS 时传递)
     logd: Logd,
+    /// ServiceS 邮箱通道容量
+    channel_capacity_n: usize,
     /// 活跃 ServiceS 句柄 (状态机不持有句柄, 由 actor 持有)
     handles: HashMap<String, ServiceS>,
     /// 等待所有 service 停止后回复 (StopAll 发起时设置)
@@ -111,7 +117,12 @@ pub struct Actor {
 
 impl Actor {
     /// 创建 actor
-    fn new(rx: mpsc::Receiver<M>, tx: mpsc::Sender<M>, logd: Logd) -> Self {
+    fn new(
+        rx: mpsc::Receiver<M>,
+        tx: mpsc::Sender<M>,
+        logd: Logd,
+        channel_capacity_n: usize,
+    ) -> Self {
         trace!("new");
 
         Self {
@@ -119,6 +130,7 @@ impl Actor {
             rx,
             tx,
             logd,
+            channel_capacity_n,
             handles: HashMap::new(),
             pending_stop_all: None,
             exit: false,
@@ -140,6 +152,11 @@ impl Actor {
                 }
                 M::M(ServiceDM::StartMany(services, reply)) => {
                     let (s1, actions) = self.sm.t(SmInput::StartMany(services));
+                    self.sm = s1;
+                    self.exec_start_many(actions, reply).await;
+                }
+                M::StartManyDone(result, reply) => {
+                    let (s1, actions) = self.sm.t(SmInput::StartManyDone(result));
                     self.sm = s1;
                     self.exec_actions_d(actions, reply).await;
                 }
@@ -178,6 +195,14 @@ impl Actor {
                 }
                 M::M(ServiceDM::QueryRunningUnits { reply }) => {
                     send_reply(reply, self.sm.running_units());
+                }
+                M::M(ServiceDM::QueryPid { pid, reply }) => {
+                    let items = self
+                        .handles
+                        .iter()
+                        .map(|(name, h)| (name.clone(), h.clone()))
+                        .collect();
+                    query::spawn_query_pid(items, pid, reply);
                 }
                 M::S(MS::ExitRequest { name, status }) => {
                     let handle = self.handles.remove(&name);
@@ -321,6 +346,70 @@ impl Actor {
         }
     }
 
+    /// 执行批量启动 (StartMany) 的动作列表.
+    ///
+    /// 若状态机直接返回 ReplyResult (例如已退出), 立即回复; 否则收集各 service
+    /// 的启动回执, 后台汇总后通过内部事件回投, 不阻塞 actor 主循环.
+    async fn exec_start_many(
+        &mut self,
+        actions: Vec<SmOutput>,
+        reply: oneshot::Sender<Result<(), SysdError>>,
+    ) {
+        if actions
+            .iter()
+            .any(|a| matches!(a, SmOutput::ReplyResult(_)))
+        {
+            self.exec_actions_d(actions, reply).await;
+            return;
+        }
+
+        let mut result: Result<(), SysdError> = Ok(());
+        let mut rxs: Vec<oneshot::Receiver<Result<(), SysdError>>> = Vec::new();
+
+        for a in actions {
+            match a {
+                SmOutput::StartService { name, conf } => {
+                    let handle = self.spawn_service(name.clone(), conf);
+                    let (svc_tx, svc_rx) = oneshot::channel();
+                    if handle
+                        .send(ServiceSM::Cmd(ServiceOp::Start, svc_tx))
+                        .await
+                        .is_err()
+                    {
+                        error!("service `{}` stopped before start command delivery", name);
+                        result = Err(SysdError::Failed(format!(
+                            "service `{}` stopped before start command delivery",
+                            name
+                        )));
+                    } else {
+                        rxs.push(svc_rx);
+                    }
+                }
+                SmOutput::SendServiceS { name, op } => match self.handles.get(&name) {
+                    Some(handle) => {
+                        let (svc_tx, svc_rx) = oneshot::channel();
+                        if handle.send(op.into_sm(svc_tx)).await.is_err() {
+                            error!("service `{}` stopped before command delivery", name);
+                            result = Err(SysdError::Failed(format!(
+                                "service `{}` stopped before command delivery",
+                                name
+                            )));
+                        } else {
+                            rxs.push(svc_rx);
+                        }
+                    }
+                    None => {
+                        error!("service `{}` not running", name);
+                        result = Err(SysdError::Failed(format!("service `{}` not running", name)));
+                    }
+                },
+                _ => unreachable!("unexpected ServiceD action for StartMany"),
+            }
+        }
+
+        spawn_start_many_wait(self.tx.clone(), rxs, result, reply);
+    }
+
     /// 直接创建并登记一个 ServiceS, 返回句柄.
     ///
     /// 先同步登记句柄与状态机 active 状态, 再让调用方投递初始命令, 保证 ServiceS
@@ -329,7 +418,7 @@ impl Actor {
         let sd = ServiceD {
             tx: self.tx.clone(),
         };
-        let handle = ServiceS::spawn(conf.clone(), self.logd.clone(), sd);
+        let handle = ServiceS::spawn(conf.clone(), self.logd.clone(), sd, self.channel_capacity_n);
         let (s1, actions) = self.sm.clone().t(SmInput::ServiceStarted {
             name: name.clone(),
             conf,
@@ -407,6 +496,35 @@ impl fmt::Debug for Actor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ServiceDActor")
     }
+}
+
+/// 等待批量启动的全部 ServiceS 命令回执, 汇总后回投内部事件.
+fn spawn_start_many_wait(
+    self_tx: mpsc::Sender<M>,
+    rxs: Vec<oneshot::Receiver<Result<(), SysdError>>>,
+    mut result: Result<(), SysdError>,
+    reply: oneshot::Sender<Result<(), SysdError>>,
+) {
+    tokio::spawn(async move {
+        for rx in rxs {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+                Err(_) => {
+                    if result.is_ok() {
+                        result = Err(SysdError::Failed("service stopped".to_string()));
+                    }
+                }
+            }
+        }
+        if self_tx.send(M::StartManyDone(result, reply)).await.is_err() {
+            error!("send start-many-done to ServiceD actor failed (actor stopped)");
+        }
+    });
 }
 
 /// 等待一个 ServiceS 命令回执, 映射为 `SdRes` (独立 task, 不阻塞主循环)

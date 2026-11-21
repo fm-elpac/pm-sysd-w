@@ -11,6 +11,7 @@
 //! 3 个程序 共用的 实例解析 / 连接 / 握手 等逻辑也放在本模块.
 
 use crate::{
+    conf::limit::SysdClientLimit,
     jsonl::{Hello, check_version, decode_hello, encode_hello},
     pa::{Instance, SysdClient, ipc_exists},
 };
@@ -79,8 +80,8 @@ pub fn resolve_instance_with(
 ///
 /// 内部先检查 IPC 端点是否存在, 再进行连接 (快速失败); 返回 可用于收发 jsonl
 /// 消息 的 [`SysdClient`].
-pub async fn connect(instance: &Instance) -> Result<SysdClient, String> {
-    let mut client = SysdClient::connect(instance)
+pub async fn connect(instance: &Instance, limit: &SysdClientLimit) -> Result<SysdClient, String> {
+    let mut client = SysdClient::connect(instance, limit)
         .await
         .map_err(|e| e.to_string())?;
 

@@ -5,11 +5,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     db::{DbClient, LogEntry, LogPos},
     jsonl::{SdReqLogRO, SdReqPagePos, SdRes, SdResLogItem, SdResLogPage, encode_frame},
-    pa::MAX_MESSAGE_LEN,
     sysd::send_reply,
 };
 
-use super::{LOG_PAGE_MAX, Logd, LogdError};
+use super::{Logd, LogdError};
 
 /// 日志分页结果
 #[derive(Debug, Clone)]
@@ -47,7 +46,7 @@ impl Logd {
         pos: SdReqPagePos<i64>,
         limit: u32,
     ) -> Result<LogPage, LogdError> {
-        page_entries_raw(&self.db, level, unit, asc, pos, limit).await
+        page_entries_raw(&self.db, level, unit, asc, pos, limit, self.ipc_m_byte).await
     }
 }
 
@@ -59,11 +58,12 @@ async fn page_entries_raw(
     asc: bool,
     pos: SdReqPagePos<i64>,
     limit: u32,
+    ipc_m_byte: usize,
 ) -> Result<LogPage, LogdError> {
     // 多取 1 条, 用于判断是否还有下一页
     let fetch = limit.saturating_add(1).max(1);
     let raw = db
-        .log_page(level, unit, asc, to_log_pos(pos), fetch, MAX_MESSAGE_LEN)
+        .log_page(level, unit, asc, to_log_pos(pos), fetch, ipc_m_byte)
         .await
         .map_err(|e| LogdError::Db(e.to_string()))?;
     let total = raw.total;
@@ -98,11 +98,17 @@ fn to_log_pos(pos: SdReqPagePos<i64>) -> LogPos {
 }
 
 /// 处理日志查询请求, 返回响应
-async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
+async fn log_ro_resp(
+    db: &DbClient,
+    cmd: &SdReqLogRO,
+    ipc_m_byte: usize,
+    log_page_n: usize,
+) -> SdRes {
     match cmd {
         SdReqLogRO::Query(query) => {
             // 外部请求的一页条数超过硬限制时, 自动按限制截断
-            let limit = query.limit.min(LOG_PAGE_MAX);
+            let log_page_n = log_page_n.min(u32::MAX as usize) as u32;
+            let limit = query.limit.min(log_page_n);
             let asc = query.asc;
             let pos = query.pos.clone();
 
@@ -113,6 +119,7 @@ async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
                 asc,
                 pos,
                 limit,
+                ipc_m_byte,
             )
             .await
             {
@@ -135,7 +142,7 @@ async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
 
             let total = page.total;
             let original_len = items.len();
-            let selected = select_logs_by_estimate(&items, MAX_MESSAGE_LEN);
+            let selected = select_logs_by_estimate(&items, ipc_m_byte);
             items.truncate(selected);
 
             // 估算截断时, 游标指向本页保留的最后一条 (被截断的数据下次继续拉取).
@@ -157,7 +164,7 @@ async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
                     Ok(line) => line,
                     Err(e) => return SdRes::Err(e.to_string()),
                 };
-                if items.len() <= 1 || line.len() <= MAX_MESSAGE_LEN {
+                if items.len() <= 1 || line.len() <= ipc_m_byte {
                     return resp;
                 }
                 items.pop();
@@ -171,9 +178,11 @@ async fn log_ro_resp(db: &DbClient, cmd: &SdReqLogRO) -> SdRes {
 pub(super) async fn run(
     mut rx: mpsc::Receiver<(SdReqLogRO, oneshot::Sender<SdRes>)>,
     db: DbClient,
+    ipc_m_byte: usize,
+    log_page_n: usize,
 ) {
     while let Some((cmd, reply)) = rx.recv().await {
-        send_reply(reply, log_ro_resp(&db, &cmd).await);
+        send_reply(reply, log_ro_resp(&db, &cmd, ipc_m_byte, log_page_n).await);
     }
 }
 

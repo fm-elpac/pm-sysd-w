@@ -3,7 +3,7 @@
 use tokio::sync::oneshot;
 
 use crate::{
-    conf::UnitType,
+    conf::{UnitType, limit::SysdLimit},
     db::{DbClient, UnitState},
     jsonl::{SdReq, SdReqUnitOp, SdReqUnitd, SdReqUnitdRO, SdRes},
     sysd::{SysDM, test_util::*},
@@ -394,7 +394,7 @@ async fn daemon_reload_reads_mask_enable_from_db() {
     // 直接通过另一个数据库客户端修改 enable, 绕过 UnitD 内存状态.
     let db_path = dir.path().join("pm_sysd_w_v1.db");
     let db_path = db_path.to_string_lossy().into_owned();
-    let db = DbClient::open(&db_path).unwrap();
+    let db = DbClient::open(&db_path, &SysdLimit::default()).unwrap();
     db.unit_write(&UnitState {
         name: "t.service".into(),
         enabled: true,

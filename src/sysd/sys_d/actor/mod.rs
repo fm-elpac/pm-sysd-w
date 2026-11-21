@@ -12,14 +12,15 @@ use log::{error, trace};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    conf::limit::SysdLimit,
     db::DbClient,
-    jsonl::SdRes,
+    jsonl::{SdReq, SdRes, SdResWhoami, SdResWhoamiInit},
     logd::Logd,
     sysd::{
         SysdError,
-        init::Shutdown,
-        reload::ReloadR,
+        reload::{ReloadR, Reloader},
         send_reply,
+        server::ServerSender,
         unit_d::{UnitD, UnitDM},
     },
 };
@@ -39,19 +40,29 @@ pub struct SysD {
 impl SysD {
     /// 启动 SysD actor (并启动其依赖的 UnitD), 返回句柄.
     ///
-    /// `exit_tx` 用于 SysD 决定退出时通知 `sysd::init`.
+    /// `server` 用于 SysD 开始退出时标记退出状态, 并在退出完成时请求 Server 退出.
     pub fn spawn(
         db: DbClient,
         logd: Logd,
         conf_path: &str,
         r: ReloadR,
-        exit_tx: oneshot::Sender<Shutdown>,
+        server: ServerSender,
+        reloader: Box<dyn Reloader>,
+        whoami: SdResWhoamiInit,
+        limit: &SysdLimit,
     ) -> Self {
-        let ud = UnitD::spawn(db.clone(), logd.clone(), conf_path.to_string(), r);
+        let ud = UnitD::spawn(
+            db.clone(),
+            logd.clone(),
+            conf_path.to_string(),
+            r,
+            reloader,
+            limit,
+        );
 
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(limit.channel_capacity_n);
 
-        tokio::spawn(Actor::new(rx, tx.clone(), ud, logd, db, exit_tx).run());
+        tokio::spawn(Actor::new(rx, tx.clone(), ud, logd, db, server, whoami).run());
 
         Self { tx }
     }
@@ -61,7 +72,9 @@ impl SysD {
         self.tx.send(M::M(m)).await.map_err(|e| {
             mpsc::error::SendError(match e.0 {
                 M::M(m) => m,
-                M::ExitUnitsDone(..) => unreachable!("SysD::send never sends internal events"),
+                M::StartDefaultTargetDone(..) | M::ExitUnitsDone(..) => {
+                    unreachable!("SysD::send never sends internal events")
+                }
             })
         })
     }
@@ -87,9 +100,12 @@ pub struct Actor {
     logd: Logd,
     /// 数据库句柄 (用于 sqlite-vacuum)
     db: DbClient,
-    /// 通知 `sysd::init` 退出的发送端 ([`SmOutput::Finish`] 动作消费一次).
-    /// 同时作为退出标记, 如果为 `None` 表示应该退出.
-    exit_tx: Option<oneshot::Sender<Shutdown>>,
+    /// Server 控制句柄 (标记退出 / 请求退出)
+    server: ServerSender,
+    /// `whoami` (无 pid) 返回的自身信息
+    whoami: SdResWhoamiInit,
+    /// 已发送 [`SmOutput::Finish`], actor 主循环应退出.
+    exited: bool,
 }
 
 impl Actor {
@@ -100,7 +116,8 @@ impl Actor {
         ud: UnitD,
         logd: Logd,
         db: DbClient,
-        exit_tx: oneshot::Sender<Shutdown>,
+        server: ServerSender,
+        whoami: SdResWhoamiInit,
     ) -> Self {
         trace!("new");
         Self {
@@ -110,7 +127,9 @@ impl Actor {
             ud,
             logd,
             db,
-            exit_tx: Some(exit_tx),
+            server,
+            whoami,
+            exited: false,
         }
     }
 
@@ -121,6 +140,17 @@ impl Actor {
             trace!("recv {:?}", m);
             match m {
                 M::M(SysDM::SdReq(req, reply)) => {
+                    // 无 pid 的 whoami 直接回复自身信息, 不经过状态机.
+                    if let SdReq::Whoami(w) = &req {
+                        if w.pid.is_none() {
+                            let resp = SdRes::Whoami(SdResWhoami {
+                                service: None,
+                                init: Some(self.whoami.clone()),
+                            });
+                            send_reply(reply, resp);
+                            continue;
+                        }
+                    }
                     let (s1, actions) = self.sm.t(SmInput::SdReq(req));
                     self.sm = s1;
                     self.exec_actions_r(actions, reply).await;
@@ -130,13 +160,18 @@ impl Actor {
                     self.sm = s1;
                     self.exec_actions_d(actions, reply).await;
                 }
+                M::StartDefaultTargetDone(result, reply) => {
+                    let (s1, actions) = self.sm.t(SmInput::StartDefaultTargetDone(result));
+                    self.sm = s1;
+                    self.exec_actions_d(actions, reply).await;
+                }
                 M::ExitUnitsDone(result, reply) => {
                     let (s1, actions) = self.sm.t(SmInput::ExitUnitsDone(result));
                     self.sm = s1;
                     self.exec_actions_r(actions, reply).await;
                 }
             };
-            if self.exit_tx.is_none() {
+            if self.exited {
                 break;
             }
         }
@@ -157,8 +192,10 @@ impl Actor {
                 None
             }
             SmOutput::Finish { shutdown } => {
-                let t = self.exit_tx.take().unwrap();
-                send_reply(t, shutdown);
+                if let Err(e) = self.server.exit(Ok(shutdown)).await {
+                    error!("send exit to server failed: {}", e);
+                }
+                self.exited = true;
                 None
             }
             o => Some(o),
@@ -204,6 +241,9 @@ impl Actor {
                 }
                 SmOutput::SendExitUnitd => {
                     let t = reply.take().unwrap();
+                    if let Err(e) = self.server.mark_exit().await {
+                        error!("mark exit on server failed: {}", e);
+                    }
                     spawn_exit_wait(self.ud.clone(), self.tx.clone(), t);
                 }
                 _ => unreachable!("unexpected SysD action for SdRes reply"),
@@ -231,9 +271,7 @@ impl Actor {
                 }
                 SmOutput::SendStartDefaultTarget => {
                     let t = reply.take().unwrap();
-                    if self.ud.send(UnitDM::StartDefaultTarget(t)).await.is_err() {
-                        error!("send start-default-target to UnitD failed (UnitD stopped)");
-                    }
+                    spawn_start_default_target_wait(self.ud.clone(), self.tx.clone(), t);
                 }
                 _ => unreachable!("unexpected SysD action for StartDefaultTarget"),
             }
@@ -245,6 +283,33 @@ impl fmt::Debug for Actor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SysDActor")
     }
+}
+
+/// 请求 UnitD 启动 default.target, 并仅在收到响应后回报内部事件.
+///
+/// 该 task 不执行其它逻辑; 后续步骤由状态机在收到
+/// [`M::StartDefaultTargetDone`] 时决定.
+fn spawn_start_default_target_wait(
+    ud: UnitD,
+    self_tx: mpsc::Sender<M>,
+    reply: oneshot::Sender<Result<(), SysdError>>,
+) {
+    tokio::spawn(async move {
+        let (tx, rx) = oneshot::channel();
+        if ud.send(UnitDM::StartDefaultTarget(tx)).await.is_err() {
+            error!("send start-default-target to UnitD failed (UnitD stopped)");
+        }
+        let result = rx
+            .await
+            .unwrap_or_else(|_| Err(SysdError::Failed("UnitD stopped".to_string())));
+        if self_tx
+            .send(M::StartDefaultTargetDone(result, reply))
+            .await
+            .is_err()
+        {
+            error!("send start-default-target-done to SysD actor failed (actor stopped)");
+        }
+    });
 }
 
 /// 请求 UnitD 停止所有 unit, 并仅在收到响应后回报内部事件.

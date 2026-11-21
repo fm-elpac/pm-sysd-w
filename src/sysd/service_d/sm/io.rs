@@ -15,6 +15,8 @@ pub enum SmInput {
     Unit(ServiceCmdUnit),
     /// 批量启动 (default.target)
     StartMany(Vec<(String, Unit)>),
+    /// 批量启动已全部完成 (携带结果)
+    StartManyDone(Result<(), SysdError>),
     /// 停止所有 service 并退出
     Exit,
     /// ServiceD actor 已直接创建 ServiceS (携带 name 与配置)

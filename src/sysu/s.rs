@@ -10,6 +10,44 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// 整个 pm-sysd-init 管理实例的运行状态 (对应 systemd 的 `ManagerState`,
+/// 即 `systemctl is-system-running` 的输出).
+///
+/// 这是 systemd 定义的所有可能输出. 本项目只使用其中的一部分, 未使用的状态
+/// 见各变体注释.
+///
+/// 尽量与 systemd 保持一致, 不要随便修改.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DaemonSta {
+    /// 早期启动阶段 (尚未到达 basic.target, 或进入维护状态).
+    ///
+    /// 本项目没有 basic.target / 维护状态, 且监听 IPC 之前不接受连接, 暂不使用.
+    Initializing,
+    /// 后期启动阶段 (job 队列第一次空闲之前, 或到达 rescue target).
+    ///
+    /// 本项目没有 job 队列, 启动阶段对外不可观察, 暂不使用.
+    Starting,
+    /// 系统完全运行.
+    Running,
+    /// 系统正在运行, 但有一个或多个 unit 失败.
+    Degraded,
+    /// rescue 或 emergency target 处于激活状态.
+    ///
+    /// 本项目没有 rescue / emergency target, 暂不使用.
+    Maintenance,
+    /// 管理器正在关闭.
+    Stopping,
+    /// 管理器未运行 (具体为不兼容的程序作为系统管理器时).
+    ///
+    /// 本项目用于 IPC 端点不存在 (pm-sysd-init 未运行) 时.
+    Offline,
+    /// 无法确定运行状态 (资源不足或其它错误).
+    ///
+    /// 本项目用于查询 ServiceD 状态失败时.
+    Unknown,
+}
+
 /// unit 的加载状态 (对应 systemd 的 `UnitLoadState`).
 ///
 /// 这是 systemd 定义的所有 unit 的可能状态.
@@ -225,6 +263,30 @@ pub enum UnitSubSta {
     Target(TargetSta),
 }
 
+impl DaemonSta {
+    /// 显示/序列化文本
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Initializing => "initializing",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Degraded => "degraded",
+            Self::Maintenance => "maintenance",
+            Self::Stopping => "stopping",
+            Self::Offline => "offline",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// `is-system-running` 退出码 (模仿 systemctl).
+    ///
+    /// 只有 `running` 返回 0, 其余状态返回 1 (systemctl 实际返回
+    /// `EXIT_FAILURE`, 即 1).
+    pub fn exit_code(&self) -> u8 {
+        if matches!(self, Self::Running) { 0 } else { 1 }
+    }
+}
+
 impl LoadSta {
     /// 显示/序列化文本
     pub fn as_str(&self) -> &'static str {
@@ -346,6 +408,12 @@ impl UnitSubSta {
             Self::Timer(s) => s.as_str(),
             Self::Target(s) => s.as_str(),
         }
+    }
+}
+
+impl fmt::Display for DaemonSta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

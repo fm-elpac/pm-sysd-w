@@ -52,9 +52,9 @@ impl ServiceS {
     /// 启动一个 ServiceS, 返回句柄.
     ///
     /// `sd` 为 ServiceD 句柄, 供 ServiceS 发送退出请求.
-    pub fn spawn(conf: Unit, logd: Logd, sd: ServiceD) -> Self {
+    pub fn spawn(conf: Unit, logd: Logd, sd: ServiceD, channel_capacity_n: usize) -> Self {
         let name = conf.name.clone();
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(channel_capacity_n);
         let self_tx = tx.clone();
 
         tokio::spawn(async move { Actor::new(rx, self_tx, conf, logd, sd).run().await });

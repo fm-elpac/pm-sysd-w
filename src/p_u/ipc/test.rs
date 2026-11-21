@@ -1,6 +1,6 @@
-//! p_u 模块测试.
+//! p_u::ipc 测试.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -34,7 +34,7 @@ async fn connect_roundtrip() {
     let path = tmp_sock(&dir);
     let mut listener = Listener::bind(&path).unwrap();
 
-    let connect = connect(&path);
+    let connect = connect(&path, Duration::from_secs(1), Duration::from_millis(20));
     let (accepted, client) = tokio::join!(listener.accept(), connect);
     let mut server = accepted.unwrap();
     let mut client = client.unwrap();

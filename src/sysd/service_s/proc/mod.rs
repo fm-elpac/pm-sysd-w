@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::{
     conf::Unit,
     logd::Logd,
-    pa::{PaError, Process, SpawnOptions},
+    pa::{NativeProc, PaError, SpawnOptions},
     sysd::SysdError,
 };
 
@@ -24,7 +24,7 @@ pub enum WatcherCmd {
 
 /// 启动一个 subprocess, 并接管其 stdout/stderr 写入 unit 日志.
 ///
-/// 返回 [`Process`] (其 stdout/stderr 已交由后台任务按行读取).
+/// 返回 [`NativeProc`] (其 stdout/stderr 已交由后台任务按行读取).
 fn spawn_with_log(
     argv: &[String],
     cwd: Option<&Path>,
@@ -32,9 +32,9 @@ fn spawn_with_log(
     opts: SpawnOptions,
     name: &str,
     logd: &Logd,
-) -> Result<Process, SysdError> {
+) -> Result<NativeProc, SysdError> {
     let mut child =
-        Process::spawn(argv, cwd, env, opts).map_err(|e| SysdError::Failed(e.to_string()))?;
+        NativeProc::spawn(argv, cwd, env, opts).map_err(|e| SysdError::Failed(e.to_string()))?;
 
     if let Some(err) = child.take_stderr() {
         logd.spawn_log_reader(name, "stderr", err);
@@ -46,7 +46,7 @@ fn spawn_with_log(
 }
 
 /// 启动一个 service 的主进程 (ExecStart)
-pub fn spawn_child(unit: &Unit, logd: &Logd) -> Result<Process, SysdError> {
+pub fn spawn_child(unit: &Unit, logd: &Logd) -> Result<NativeProc, SysdError> {
     // TODO: sysd 暂只支持一个 ExecStart, 多行语法只取第一行.
     // TODO: conf 已允许 ExecStart 为空 (配合 RemainAfterExit=yes), sysd 暂不支持
     // 此用法, 仍按 ExecStart 为空报错.
@@ -128,7 +128,7 @@ pub async fn run_exec(
     }
 }
 
-/// 把 `Process::wait` 的结果转换为 [`ExitInfo`]
+/// 把 `NativeProc::wait` 的结果转换为 [`ExitInfo`]
 fn exit_info(r: Result<std::process::ExitStatus, PaError>) -> ExitInfo {
     match r {
         Ok(status) => ExitInfo {
@@ -147,7 +147,7 @@ fn exit_info(r: Result<std::process::ExitStatus, PaError>) -> ExitInfo {
 /// 持有子进程, 等待其自然退出; 收到终止命令时终止并等待退出. 无论自然退出还是
 /// 被终止, 都通过 `tx` 发送一次 [`M::ChildExited`].
 pub fn spawn_watcher(
-    mut child: Process,
+    mut child: NativeProc,
     tx: mpsc::Sender<M>,
     mut kill_rx: mpsc::Receiver<WatcherCmd>,
 ) {

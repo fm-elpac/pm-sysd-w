@@ -25,13 +25,29 @@ pub enum SdReq {
     UnitRO(SdReqUnitRO),
     /// 单个 unit 修改操作
     Unit(SdReqUnit),
+    /// whoami 查询 (按 pid 查 service, 或查询 init 自身信息)
+    Whoami(SdReqWhoami),
 }
 
 impl SdReq {
     /// 是否为只读请求 (允许从只读连接发出).
     pub fn is_readonly(&self) -> bool {
-        matches!(self, SdReq::LogRO(_) | SdReq::UnitdRO(_) | SdReq::UnitRO(_))
+        matches!(
+            self,
+            SdReq::LogRO(_) | SdReq::UnitdRO(_) | SdReq::UnitRO(_) | SdReq::Whoami(_)
+        )
     }
+}
+
+/// `whoami` 请求.
+///
+/// `pid` 为 `None` 时查询 pm-sysd-init 自身信息; `Some(pid)` 时查询该 pid
+/// 是否属于某个正在运行的 service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdReqWhoami {
+    /// 要查询的 pid (省略则查询 init 自身)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// 分页查询条件: 开始位置 (通用).
@@ -78,6 +94,8 @@ pub enum SdReqUnitdRO {
     ListUnits(SdReqUnitList),
     /// 列出 timer
     ListTimers,
+    /// 查询整个管理实例的运行状态 (`is-system-running`)
+    SystemState,
     /// 显示环境变量 (初版 TODO)
     ShowEnvironment,
 }

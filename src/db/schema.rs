@@ -1,4 +1,4 @@
-//! 数据库 schema 定义 与 迁移.
+//! 数据库 schema 定义与迁移.
 
 use rusqlite::Transaction;
 
@@ -6,14 +6,14 @@ use super::DbError;
 
 /// 当前数据库 schema 版本 (整数, 每次 schema 变更时递增).
 ///
-/// 在 v0.1.0 发布之前 (覆盖所有 0.1.0-* 预发布版本) 保持为 1, 不升级 schema
-/// 版本.
+/// 在 v0.1.0 发布之前 (覆盖所有 0.1.0-* 预发布版本) 保持为 1,
+/// 不升级 schema 版本.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// 本程序的数据库标识 (写入 `pm_sysd_w_meta` 表的 `program` 键, 打开时校验).
+/// 本程序的数据库标识 (写入 `pm_sysd_w_meta` 表的 `program` 键, 打开时校验)
 pub const PROGRAM_NAME: &str = "pm-sysd-w";
 
-/// v1 基础表结构 (不含索引).
+/// v1 基础表结构 (不含索引)
 pub const SCHEMA_TABLES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pm_sysd_w_meta (
   key   TEXT PRIMARY KEY,
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS log (
 );
 "#;
 
-/// 新建数据库 时执行的 schema (表结构 + 索引).
+/// 新建数据库 时执行的 schema (表结构 + 索引)
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pm_sysd_w_meta (
   key   TEXT PRIMARY KEY,

@@ -35,10 +35,10 @@ pub use hello::{
 pub use log::{SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdResLogItem, SdResLogPage};
 pub use req::{
     SdReq, SdReqPagePos, SdReqSysd, SdReqUnit, SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO,
-    SdReqUnitRO, SdReqUnitd, SdReqUnitdRO,
+    SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdReqWhoami,
 };
 pub use res::{
     SdRes, SdResPage, SdResServiceStatus, SdResTimerInfo, SdResTimerStatus, SdResUnitS,
-    SdResUnitState, SdResUnitStatus,
+    SdResUnitState, SdResUnitStatus, SdResWhoami, SdResWhoamiInit,
 };
 pub use util::{decode_frame, encode_frame};

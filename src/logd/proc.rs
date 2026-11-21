@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 
 use crate::pa::TextDecoder;
 
-use super::{Logd, MAX_LOG_LEN};
+use super::Logd;
 
 impl Logd {
     /// 启动后台任务: 按行读取子进程的 stdout/stderr, 写入对应 unit 日志.
@@ -18,11 +18,12 @@ impl Logd {
         let logd = self.clone();
         let name = name.to_string();
         let level = level.to_string();
+        let line_byte = self.line_byte;
         tokio::spawn(async move {
             let mut reader = BufReader::new(reader);
             let mut decoder = TextDecoder::new();
             loop {
-                let (mut buf, ended) = match read_log_chunk(&mut reader, MAX_LOG_LEN).await {
+                let (mut buf, ended) = match read_log_chunk(&mut reader, line_byte).await {
                     // 读到 EOF: 管道关闭 (子进程退出), 结束本任务.
                     Ok(Some(v)) => v,
                     Ok(None) => break,
@@ -41,11 +42,11 @@ impl Logd {
                 let msg = match decoder.decode(&buf) {
                     Ok(s) => s,
                     // 解码失败 (Windows ACP 模式失败): 换成一条 error 日志.
-                    Err(e) => {
+                    Err(_) => {
                         logd.write_with(
                             "error",
                             Some(&name),
-                            &format!("subprocess {} output decode failed: {}", level, e),
+                            &format!("utf-8 decode error ({})", level),
                         )
                         .expect("write subprocess decode error log");
                         continue;
@@ -67,11 +68,11 @@ impl Logd {
                             .expect("write subprocess output log");
                     }
                 }
-                Err(e) => {
+                Err(_) => {
                     logd.write_with(
                         "error",
                         Some(&name),
-                        &format!("subprocess {} output decode failed at eof: {}", level, e),
+                        &format!("utf-8 decode error ({})", level),
                     )
                     .expect("write subprocess decode error log");
                 }

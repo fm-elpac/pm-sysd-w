@@ -16,9 +16,12 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 use log::{error, trace};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::conf::limit::SysdLimit;
 
 use crate::{
     db::{DbClient, DbError, UnitState},
@@ -26,7 +29,7 @@ use crate::{
     logd::Logd,
     sysd::{
         SysdError,
-        reload::{ReloadR, reload},
+        reload::{ReloadR, Reloader},
         send_reply,
         service_d::{ServiceD, ServiceDM},
     },
@@ -52,16 +55,27 @@ impl UnitD {
     /// 启动 UnitD actor (并启动其依赖的 ServiceD), 返回句柄.
     ///
     /// `r` 为已完成的加载结果 (配置与 mask/enable 状态), 直接用于构造初始状态.
-    pub fn spawn(db: DbClient, logd: Logd, conf_path: String, r: ReloadR) -> Self {
-        let sd = ServiceD::spawn(logd.clone());
+    pub fn spawn(
+        db: DbClient,
+        logd: Logd,
+        conf_path: String,
+        r: ReloadR,
+        reloader: Box<dyn Reloader>,
+        limit: &SysdLimit,
+    ) -> Self {
+        let sd = ServiceD::spawn(logd.clone(), limit.channel_capacity_n);
+        let reloader = Arc::from(reloader);
 
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(limit.channel_capacity_n);
         let self_tx = tx.clone();
+        let ipc_m_byte = limit.ipc_m_byte;
 
         tokio::spawn(async move {
-            Actor::new(rx, self_tx, logd, db, conf_path, sd, r)
-                .run()
-                .await;
+            Actor::new(
+                rx, self_tx, logd, db, conf_path, sd, r, reloader, ipc_m_byte,
+            )
+            .run()
+            .await;
         });
 
         Self { tx }
@@ -98,6 +112,10 @@ pub struct Actor {
     db: DbClient,
     /// ServiceD 句柄
     sd: ServiceD,
+    /// 配置加载器 (daemon-reload 后台任务使用)
+    reloader: Arc<dyn Reloader>,
+    /// IPC 单条消息最大长度 (list-units 响应截断)
+    ipc_m_byte: usize,
     /// 自身串行操作的等候队列 (FIFO)
     wait: VecDeque<(SdReq, oneshot::Sender<SdRes>)>,
     /// 退出标记: 收到 [`SmOutput::Exit`] 后主循环退出
@@ -114,6 +132,8 @@ impl Actor {
         conf_path: String,
         sd: ServiceD,
         r: ReloadR,
+        reloader: Arc<dyn Reloader>,
+        ipc_m_byte: usize,
     ) -> Self {
         trace!("new");
 
@@ -125,6 +145,8 @@ impl Actor {
             logd,
             db,
             sd,
+            reloader,
+            ipc_m_byte,
             wait: VecDeque::new(),
             exit: false,
         }
@@ -234,7 +256,7 @@ impl Actor {
                 // SmOutput::SendTimer => {}
                 SmOutput::QueryService(req) => {
                     let t = reply.take().unwrap();
-                    spawn_query(req, self.sd.clone(), t);
+                    spawn_query(req, self.sd.clone(), t, self.ipc_m_byte);
                 }
                 SmOutput::WriteDb(write, pending) => {
                     let t = reply.take().unwrap();
@@ -242,7 +264,13 @@ impl Actor {
                 }
                 SmOutput::Reload(conf_path) => {
                     let t = reply.take().unwrap();
-                    spawn_reload(self.db.clone(), conf_path, self.tx.clone(), t);
+                    spawn_reload(
+                        self.db.clone(),
+                        self.reloader.clone(),
+                        conf_path,
+                        self.tx.clone(),
+                        t,
+                    );
                 }
                 _ => unreachable!("unexpected UnitD action for SdRes reply"),
             }
@@ -311,17 +339,18 @@ impl fmt::Debug for Actor {
 
 /// 触发 daemon-reload (spawn 独立 task, 主循环不等待).
 ///
-/// 使用与 pm-sysd-init 启动时相同的共享加载逻辑 (传入已打开的 `db`, 跳过打开数据库).
+/// 通过注入的 [`Reloader`] 加载配置 (传入已打开的 `db`, 跳过打开数据库).
 /// 成功后回传 [`M::ReloadOk`] (由状态机更新状态并回复).
 /// 失败则回传 [`M::ReloadErr`] (由状态机清理 reload 状态并回复, 旧配置保持不变).
 fn spawn_reload(
     db: DbClient,
+    reloader: Arc<dyn Reloader>,
     conf_path: String,
     tx: mpsc::Sender<M>,
     reply: oneshot::Sender<SdRes>,
 ) {
     tokio::spawn(async move {
-        match reload(Some(db), &conf_path).await {
+        match reloader.reload(Some(db), &conf_path).await {
             Ok((r, _)) => {
                 if tx.send(M::ReloadOk(r, reply)).await.is_err() {
                     error!("reload: UnitD stopped");

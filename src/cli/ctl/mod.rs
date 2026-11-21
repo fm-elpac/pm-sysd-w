@@ -23,11 +23,13 @@ use tokio::runtime::Runtime;
 
 use crate::{
     cli::{complete_unit, connect, resolve_instance, set_instance},
+    conf::limit::SysdClientLimit,
     jsonl::{
-        SdReq, SdReqUnitList, SdReqUnitdRO, SdRes, SdResUnitState, decode_frame, encode_frame,
+        SdReq, SdReqUnitList, SdReqUnitdRO, SdReqWhoami, SdRes, SdResUnitState, decode_frame,
+        encode_frame,
     },
-    pa::Instance,
-    sysu::ctl::{print_list_units, print_response},
+    pa::{Instance, ipc_exists},
+    sysu::ctl::{print_list_units, print_response, print_whoami},
 };
 
 mod error;
@@ -50,10 +52,14 @@ struct Args {
     units: Vec<String>,
     /// `--now` (用于 `enable --now` / `disable --now`)
     now: bool,
+    /// `--json` (用于 `whoami`, 单行 JSON 输出)
+    json: bool,
 }
 
 /// pm-sysd-ctl 命令行入口
 pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
+    let limit = SysdClientLimit::from_env();
+
     if a.is_empty() || a.iter().any(|s| s == "-h" || s == "--help") {
         print_help();
         return Ok(());
@@ -67,9 +73,24 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    // 在发送命令之前, 先做命令语法检查 (`whoami` 不需要命令参数)
+    // 在发送命令之前, 先做命令语法检查.
+    if args.now && !matches!(args.command.as_str(), "enable" | "disable" | "mask") {
+        eprintln!("--now is only valid with enable/disable/mask");
+        return Err(ExitCode::FAILURE);
+    }
+    if args.json && args.command != "whoami" {
+        eprintln!("--json is only valid with whoami");
+        return Err(ExitCode::FAILURE);
+    }
+
     let command = if args.command == "whoami" {
-        None
+        match build_whoami(&args.units) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("{}", e);
+                return Err(ExitCode::FAILURE);
+            }
+        }
     } else {
         match build_command(&args.command, &args.units, args.now) {
             Ok(c) => Some(c),
@@ -92,21 +113,29 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
     let instance = match resolve_instance(args.instance) {
         Ok(i) => i,
         Err(e) => {
+            // is-system-running 在管理器未运行时输出 offline (模仿 systemctl).
+            if args.command == "is-system-running" {
+                println!("offline");
+                return Err(ExitCode::from(1));
+            }
             eprintln!("{}", e);
             return Err(ExitCode::FAILURE);
         }
     };
 
-    // `whoami`: 报告实际选择的实例名称
-    if args.command == "whoami" {
-        println!("{}", instance.name());
-        return Ok(());
+    // 显式指定实例时 resolve_instance 不会检查端点, 这里为 is-system-running
+    // 补一次检查, 保证 --system 等显式指定时也能输出 offline.
+    if args.command == "is-system-running" && !ipc_exists(&instance.transport()) {
+        println!("offline");
+        return Err(ExitCode::from(1));
     }
 
     match rt.block_on(run(
-        command.expect("non-whoami command"),
+        command.expect("command is always built"),
         &args.command,
         instance,
+        args.json,
+        &limit,
     )) {
         Ok(code) => {
             if code == 0 {
@@ -128,6 +157,7 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
     let mut command: Option<String> = None;
     let mut units = Vec::new();
     let mut now = false;
+    let mut json = false;
 
     let mut i = 0;
     while i < a.len() {
@@ -136,6 +166,7 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
             "--system" => set_instance(&mut instance, Instance::System).map_err(CtlError::Msg)?,
             "--user" => set_instance(&mut instance, Instance::User).map_err(CtlError::Msg)?,
             "--now" => now = true,
+            "--json" => json = true,
             "--wait" | "--no-block" => {}
             "-h" | "--help" => {}
             _ => {
@@ -171,7 +202,27 @@ fn parse_args(a: &[String]) -> Result<Args, CtlError> {
         command,
         units,
         now,
+        json,
     })
+}
+
+/// 把 `whoami` 参数转换为结构化 [`SdReq`].
+///
+/// 支持 0 或 1 个 pid 参数 (pid 必须为 u32 十进制整数).
+fn build_whoami(units: &[String]) -> Result<SdReq, CtlError> {
+    let pid = match units.len() {
+        0 => None,
+        1 => match units[0].parse::<u32>() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                return Err(CtlError::Msg(format!("invalid pid: {}", units[0])));
+            }
+        },
+        _ => {
+            return Err(CtlError::Msg("command `whoami` takes at most 1 pid".into()));
+        }
+    };
+    Ok(SdReq::Whoami(SdReqWhoami { pid }))
 }
 
 /// 把命令字符串 + 参数转换为结构化 [`SdReq`], 并做语法检查
@@ -336,6 +387,10 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
         "set-default" => C::UnitD(Ud::SetDefault {
             target: target(command)?,
         }),
+        "is-system-running" => {
+            no_args(command)?;
+            C::UnitdRO(Udr::SystemState)
+        }
         "show-environment" => {
             no_args(command)?;
             C::UnitdRO(Udr::ShowEnvironment)
@@ -376,8 +431,14 @@ fn build_command(command: &str, units: &[String], now: bool) -> Result<SdReq, Ct
 }
 
 /// 主流程
-async fn run(command: SdReq, command_name: &str, instance: Instance) -> Result<u8, CtlError> {
-    let mut stream = connect(&instance).await.map_err(CtlError::Msg)?;
+async fn run(
+    command: SdReq,
+    command_name: &str,
+    instance: Instance,
+    json: bool,
+    limit: &SysdClientLimit,
+) -> Result<u8, CtlError> {
+    let mut stream = connect(&instance, limit).await.map_err(CtlError::Msg)?;
 
     // list-units 是分页接口: 循环拉取直到没有下一页, 再统一打印.
     if let SdReq::UnitdRO(SdReqUnitdRO::ListUnits(_)) = &command {
@@ -397,6 +458,9 @@ async fn run(command: SdReq, command_name: &str, instance: Instance) -> Result<u
         .await
         .map_err(|e| CtlError::Msg(e.to_string()))?;
     let resp: SdRes = decode_frame(&line).map_err(|e| CtlError::Msg(e.to_string()))?;
+    if command_name == "whoami" {
+        return Ok(print_whoami(&resp, json));
+    }
     Ok(print_response(command_name, &command, resp))
 }
 
@@ -454,9 +518,11 @@ fn print_help() {
     println!("常用命令:");
     println!("  list-units  start  stop  restart  status  enable  disable  is-enabled");
     println!("  mask  unmask  get-default  set-default  daemon-reload  exit");
+    println!("  whoami  [PID]  查询 init 自身信息, 或按 pid 查 service");
     println!();
     println!("选项:");
     println!("  --now           enable/disable 同时 start/stop");
+    println!("  --json          whoami 以单行 JSON 输出");
     println!("  --wait          等待操作完成");
     println!("  --no-block      不等待 (默认)");
     println!("  -h --help       显示帮助");

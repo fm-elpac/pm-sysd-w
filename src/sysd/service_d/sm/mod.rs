@@ -85,6 +85,7 @@ impl Sm {
         let actions = match input {
             SmInput::Unit(cmd) => self.handle_unit(cmd),
             SmInput::StartMany(services) => self.handle_start_many(services),
+            SmInput::StartManyDone(result) => self.handle_start_many_done(result),
             SmInput::Exit => self.handle_exit(),
             SmInput::ServiceStarted { name, conf } => self.handle_service_started(name, conf),
             SmInput::ServiceTerminated { name, status } => {
@@ -201,8 +202,12 @@ impl Sm {
                 actions.push(SmOutput::StartService { name, conf });
             }
         }
-        actions.push(SmOutput::ReplyResult(Ok(())));
         actions
+    }
+
+    /// 处理批量启动全部完成
+    fn handle_start_many_done(&self, result: Result<(), SysdError>) -> Vec<SmOutput> {
+        vec![SmOutput::ReplyResult(result)]
     }
 
     /// 处理退出 (请求停止所有 service, 由 actor 等待句柄移除后完成)

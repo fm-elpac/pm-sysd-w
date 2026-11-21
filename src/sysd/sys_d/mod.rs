@@ -12,8 +12,8 @@
 //! exit / soft-reboot 时, SysD 才会等待 UnitD 停止所有 unit. `sqlite-vacuum`
 //! 同样不阻塞主循环: 由独立 task 投递给数据库读写线程处理.
 //!
-//! 退出时: 先通知 UnitD 停止所有 unit, 再通过 `exit_tx` (oneshot) 通知
-//! `sysd::init`, 最后退出自己的循环.
+//! 退出时: 先通知 UnitD 停止所有 unit, 再通过 `ServerSender` 通知 Server,
+//! 最后退出自己的循环.
 
 mod actor;
 mod sm;

@@ -5,9 +5,9 @@ use crate::conf::{Install, RestartPolicy, Service, ServiceType, Unit, UnitType, 
 use super::{
     Hello, PROTOCOL_VERSION, SdReq, SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdReqPagePos,
     SdReqSysd, SdReqUnit, SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd,
-    SdReqUnitdRO, SdRes, SdResLogItem, SdResPage, SdResServiceStatus, SdResTimerInfo, SdResUnitS,
-    SdResUnitState, SdResUnitStatus, VERSION, check_version, decode_frame, decode_hello,
-    encode_frame, encode_hello,
+    SdReqUnitdRO, SdReqWhoami, SdRes, SdResLogItem, SdResPage, SdResServiceStatus, SdResTimerInfo,
+    SdResUnitS, SdResUnitState, SdResUnitStatus, SdResWhoami, SdResWhoamiInit, VERSION,
+    check_version, decode_frame, decode_hello, encode_frame, encode_hello,
 };
 
 use crate::sysu::{EnableSta, LoadSta, ServiceSta, UnitSta, UnitSubSta};
@@ -177,6 +177,8 @@ fn command_roundtrip() {
         SdReq::SysD(SdReqSysd::SoftReboot),
         SdReq::SysD(SdReqSysd::Exit),
         SdReq::SysD(SdReqSysd::SqliteVacuum),
+        SdReq::Whoami(SdReqWhoami { pid: None }),
+        SdReq::Whoami(SdReqWhoami { pid: Some(42) }),
     ];
 
     for cmd in cases {
@@ -252,6 +254,28 @@ fn response_roundtrip() {
                 unit: Some("a.service".into()),
                 msg: "m".into(),
             }],
+        }),
+        SdRes::Whoami(SdResWhoami {
+            service: Some("a.service".into()),
+            init: None,
+        }),
+        SdRes::Whoami(SdResWhoami {
+            service: None,
+            init: Some(SdResWhoamiInit {
+                instance_type: "user".into(),
+                instance_name: "alice".into(),
+                pid: 1234,
+                service_name: None,
+            }),
+        }),
+        SdRes::Whoami(SdResWhoami {
+            service: None,
+            init: Some(SdResWhoamiInit {
+                instance_type: "system".into(),
+                instance_name: String::new(),
+                pid: 42,
+                service_name: Some("pm_sysd_w_user".into()),
+            }),
         }),
     ];
 

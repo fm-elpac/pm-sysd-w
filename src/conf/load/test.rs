@@ -1,8 +1,14 @@
-//! conf 模块测试.
+//! conf::load 模块测试.
 
+use crate::conf::{Conf, ConfError, RestartPolicy, ServiceType, UnitType, limit::SysdLimit};
 use crate::test::TempDir;
 
-use super::{RestartPolicy, ServiceType, UnitType, load_conf};
+use super::FsReader;
+
+/// 使用默认限制加载配置 (测试辅助).
+fn load_conf(path: &str) -> Result<Conf, ConfError> {
+    crate::conf::load_conf(path, &SysdLimit::default())
+}
 
 /// 写入 配置文本 到 临时目录, 返回 配置文件 路径.
 fn write_conf(dir: &TempDir, text: &str) -> String {
@@ -34,6 +40,22 @@ SYSD_DB = "{}"
 "env:Service.ExecStart" = "bin"
 "#,
         db
+    )
+}
+
+/// 带 `[env] SYSD_DB_LOG_NO_INDEX` 的 配置.
+fn conf_with_db_log_no_index(value: &str) -> String {
+    format!(
+        r#"pm_tc = 1
+
+[env]
+SYSD_DB_LOG_NO_INDEX = "{}"
+
+[[t.sysd]]
+"env:Unit" = "a.service"
+"env:Service.ExecStart" = "bin"
+"#,
+        value
     )
 }
 
@@ -95,6 +117,7 @@ fn defaults() {
     assert!(u.install.wanted_by.is_empty());
     assert!(!u.win.create_no_window);
     assert!(conf.db_path.ends_with("pm_sysd_w_v1.db"));
+    assert!(!conf.db_log_no_index);
 }
 
 #[test]
@@ -151,6 +174,7 @@ fn empty_conf() {
     let conf = load_conf(&path).unwrap();
     assert!(conf.units.is_empty());
     assert!(conf.db_path.ends_with("pm_sysd_w_v1.db"));
+    assert!(!conf.db_log_no_index);
 }
 
 #[test]
@@ -223,6 +247,31 @@ fn db_path_resolution() {
     let abs = "/pm_sysd_w_test_abs.db";
     let ab = write_conf(&dir, &conf_with_db(abs));
     assert_eq!(load_conf(&ab).unwrap().db_path, abs);
+}
+
+#[test]
+fn db_log_no_index_default_and_values() {
+    let dir = TempDir::new("conf");
+
+    // 缺省为 false.
+    let default = write_conf(&dir, basic_conf());
+    assert!(!load_conf(&default).unwrap().db_log_no_index);
+
+    // 值为 "0" 表示 false.
+    let zero = write_conf(&dir, &conf_with_db_log_no_index("0"));
+    assert!(!load_conf(&zero).unwrap().db_log_no_index);
+
+    // 值为 "1" 表示 true.
+    let one = write_conf(&dir, &conf_with_db_log_no_index("1"));
+    assert!(load_conf(&one).unwrap().db_log_no_index);
+}
+
+#[test]
+fn db_log_no_index_bad_value() {
+    let dir = TempDir::new("conf");
+    let path = write_conf(&dir, &conf_with_db_log_no_index("yes"));
+    let e = load_conf(&path).unwrap_err();
+    assert!(e.to_string().contains("SYSD_DB_LOG_NO_INDEX"));
 }
 
 #[test]
@@ -831,15 +880,6 @@ fn remain_after_exit_bool_keywords() {
 }
 
 #[test]
-fn enum_as_str() {
-    assert_eq!(ServiceType::Simple.as_str(), "simple");
-    assert_eq!(ServiceType::Oneshot.as_str(), "oneshot");
-    assert_eq!(RestartPolicy::No.as_str(), "no");
-    assert_eq!(RestartPolicy::Always.as_str(), "always");
-    assert_eq!(RestartPolicy::OnFailure.as_str(), "on-failure");
-}
-
-#[test]
 fn unsupported_key_warnings() {
     let dir = TempDir::new("conf");
     let path = write_conf(
@@ -909,7 +949,7 @@ fn conf_total_size_limit() {
     std::fs::write(&path, "12345").unwrap();
     let p = path.to_string_lossy().into_owned();
 
-    let mut r = super::FsReader { total: 0, limit: 4 };
+    let mut r = FsReader { total: 0, limit: 4 };
     let e = r.read(&p).unwrap_err();
     assert!(e.to_string().contains("total size"));
 }
@@ -923,7 +963,7 @@ fn conf_total_size_exact_ok() {
     std::fs::write(&path, "1234").unwrap();
     let p = path.to_string_lossy().into_owned();
 
-    let mut r = super::FsReader { total: 0, limit: 4 };
+    let mut r = FsReader { total: 0, limit: 4 };
     let text = r.read(&p).unwrap();
     assert_eq!(text, "1234");
     assert_eq!(r.total, 4);

@@ -17,11 +17,18 @@ pm_tc = 1
 
 - The `[env]` section (optional) holds pm-sysd-w's own settings:
 
-| Field     | Type   | Required | Default           | Description                                       |
-| --------- | ------ | -------- | ----------------- | ------------------------------------------------- |
-| `SYSD_DB` | string | no       | `pm_sysd_w_v1.db` | Local database path (relative to the main config) |
+| Field                  | Type    | Required | Default           | Description                                                        |
+| ---------------------- | ------- | -------- | ----------------- | ------------------------------------------------------------------ |
+| `SYSD_DB`              | string  | no       | `pm_sysd_w_v1.db` | Local database path (relative to the main config file's directory) |
+| `SYSD_DB_LOG_NO_INDEX` | boolean | no       | `0`               | Do not create indexes on the log table; only `0` / `1` are allowed |
 
 - `SYSD_DB` is read only at startup; `daemon-reload` does not change it.
+
+- `SYSD_DB_LOG_NO_INDEX` accepts only `0` or `1`, and defaults to `0`. When set
+  to `1`, the log table of a newly created database has no indexes, which suits
+  append-only writes of many small log entries without considering query
+  performance. It only affects newly created databases, existing databases are
+  unchanged.
 
 ## unit (service)
 
@@ -49,6 +56,7 @@ unit file section/key names.
 | Field                          | Type       | Required | Default           | Description                                                       |
 | ------------------------------ | ---------- | -------- | ----------------- | ----------------------------------------------------------------- |
 | `env:Service.Type`             | enum       | no       | `simple`          | Start type (values below)                                         |
+| `env:Service.RemainAfterExit`  | bool       | no       | `no`              | Whether to stay active after the process exits                    |
 | `env:Service.ExecStart`        | string     | no       | -                 | Start command (program path + args); supports `multi-line syntax` |
 | `env:Service.ExecStop`         | string     | no       | -                 | Stop command; supports `multi-line syntax`                        |
 | `env:Service.ExecReload`       | string     | no       | -                 | Reload command; supports `multi-line syntax`                      |
@@ -58,7 +66,6 @@ unit file section/key names.
 | `env:Service.TimeoutStopSec`   | nonneg int | no       | `90`              | Stop timeout (seconds); `0` disables                              |
 | `env:Service.WorkingDirectory` | string     | no       | inherit from init | Working directory                                                 |
 | `env:Service.Environment`      | string     | no       | -                 | Environment variable, `NAME=VALUE`; supports `multi-line syntax`  |
-| `env:Service.RemainAfterExit`  | bool       | no       | `no`              | Whether to stay active after the process exits                    |
 
 `Type` values:
 
@@ -75,18 +82,15 @@ unit file section/key names.
 | `always`     | Always restart after exit                      |
 | `on-failure` | Restart only on abnormal exit (nonzero/signal) |
 
----
+#### `Exec*` Notes
 
-`Exec*` notes:
+All such fields (`ExecStart`, `ExecStop`, `ExecReload`) use pm-tc to split the
+command-line arguments (equivalent to `pm-tc --exec-eval`). Shell quoting /
+escaping syntax is not supported.
 
-- All such fields (`ExecStart`, `ExecStop`, `ExecReload`) use pm-tc to split the
-  command-line arguments (equivalent to `pm-tc --exec-eval`). Shell quoting /
-  escaping syntax is not supported.
+#### `ExecStart` and `ExecStop` Requirements
 
----
-
-`ExecStart` and `ExecStop` requirements: the overall principle is that the
-service must be meaningful. Specific rules:
+The overall principle is that the service must be meaningful. Specific rules:
 
 - `ExecStart` and `ExecStop` cannot both be empty, because that would mean the
   service does nothing.
@@ -98,12 +102,10 @@ service must be meaningful. Specific rules:
   service succeeds immediately when started. Otherwise, if `RemainAfterExit=no`,
   it would do nothing.
 
-This check is implemented.
+#### `Environment` Value
 
----
-
-`Environment` value: one `env:Service.Environment` sets a single environment
-variable. To set multiple environment variables, use `multi-line syntax`.
+One `env:Service.Environment` sets a single environment variable. To set
+multiple environment variables, use `multi-line syntax`.
 
 ### `env:Install.*`
 
@@ -113,9 +115,14 @@ variable. To set multiple environment variables, use `multi-line syntax`.
 
 ### `env:Win.*` (Windows-specific extension)
 
-| Field                    | Type | Required | Default | Description                                                                                |
-| ------------------------ | ---- | -------- | ------- | ------------------------------------------------------------------------------------------ |
-| `env:Win.CreateNoWindow` | bool | no       | `no`    | Set `CREATE_NO_WINDOW` when starting the process, so console programs show no black window |
+| Field                    | Type | Required | Default | Description                                |
+| ------------------------ | ---- | -------- | ------- | ------------------------------------------ |
+| `env:Win.CreateNoWindow` | bool | no       | `no`    | Hide the black window for console programs |
+
+- `Win.CreateNoWindow` sets the `CREATE_NO_WINDOW` flag when starting the
+  process, so no console window is shown.
+
+---
 
 Windows only; ignored on Linux.
 
@@ -174,6 +181,9 @@ Only built-in targets are supported; custom targets are not:
 - The total size of all TOML files loaded by pm-tc must not exceed 10 MB;
   exceeding it fails immediately.
 
+- The JSON output by `--reload` must not exceed 10 MB; exceeding it reports an
+  error and does not write to stdout.
+
 - A unit name must be at most 500 bytes (UTF-8) and must pass pm-tc's
   variable-name check. The name must end with a `.service` / `.timer` /
   `.target` suffix, and must not be empty before the suffix. The initial version
@@ -185,6 +195,74 @@ Only built-in targets are supported; custom targets are not:
 
   The total of all supported key-value pairs in one unit must not exceed 500 KB.
   Unsupported keys are not counted.
+
+- pm-tc must finish loading the config within 2 seconds, otherwise it reports an
+  error. This is to avoid exponentially exploding computation similar to an
+  infinite loop (hang).
+
+## Environment Variable Configuration
+
+pm-sysd-init, pm-sysd-ctl, and pm-sysd-log read a set of environment variables
+at startup to override the built-in defensive limits. When unset, defaults are
+used. When set but invalid, a warning is logged and the default is used.
+
+These values are read only once at startup / initialization, and do not change
+afterwards.
+
+The unit of a numeric value is determined by the variable-name suffix:
+
+| Suffix  | Unit               |
+| ------- | ------------------ |
+| `_BYTE` | bytes              |
+| `_N`    | count              |
+| `_MS`   | milliseconds (int) |
+| `_M`    | minutes (int)      |
+
+### Used by pm-sysd-init
+
+| Environment variable                  | Default         | Description                                           |
+| ------------------------------------- | --------------- | ----------------------------------------------------- |
+| `SYSD_CONF_LIMIT_TOTAL_BYTE`          | 10485760 (10MB) | Total size limit for all TOML files                   |
+| `SYSD_LIMIT_UNIT_NAME_BYTE`           | 500             | Maximum unit-name length                              |
+| `SYSD_LIMIT_UNIT_KEY_BYTE`            | 500             | Maximum `env:` key length                             |
+| `SYSD_LIMIT_UNIT_VALUE_BYTE`          | 20480 (20KB)    | Maximum `env:` value length                           |
+| `SYSD_LIMIT_UNIT_TOTAL_BYTE`          | 512000 (500KB)  | Total size limit for one unit's supported key/values  |
+| `SYSD_LIMIT_IPC_M_BYTE`               | 10485760 (10MB) | Maximum length of one IPC message                     |
+| `SYSD_LIMIT_IPC_SEND_TIMEOUT_MS`      | 1000            | Send timeout for one IPC message                      |
+| `SYSD_LIMIT_IPC_RECV_TIMEOUT_MS`      | 1000            | Receive timeout for one IPC message                   |
+| `SYSD_LIMIT_IPC_CONN_N`               | 200             | Maximum concurrent connections on the main pipe       |
+| `SYSD_LIMIT_IPC_CONN_RO_N`            | 50              | Maximum concurrent connections on the read-only pipe  |
+| `SYSD_LIMIT_IPC_HANDSHAKE_TIMEOUT_MS` | 1000            | Handshake timeout                                     |
+| `SYSD_LIMIT_IPC_IDLE_TIMEOUT_MS`      | 1000            | Idle timeout                                          |
+| `SYSD_LIMIT_RELOAD_SOFT_TIMEOUT_MS`   | 1000            | Soft timeout for the reload process                   |
+| `SYSD_LIMIT_RELOAD_HARD_TIMEOUT_MS`   | 2000            | Hard timeout for the reload process                   |
+| `SYSD_LIMIT_LOG_LINE_BYTE`            | 512000 (500KB)  | Maximum length of one log entry                       |
+| `SYSD_LIMIT_LOG_PAGE_N`               | 10000           | Maximum entries per log page query                    |
+| `SYSD_LIMIT_LOG_CLEAN_INTERVAL_M`     | 60 (1 hour)     | Log auto-clean interval                               |
+| `SYSD_LIMIT_LOG_RETENTION_M`          | 4320 (72 hours) | Log retention period                                  |
+| `SYSD_LIMIT_WARN_INTERVAL_MIN_MS`     | 1000            | Minimum interval for dropped-log warnings             |
+| `SYSD_LIMIT_LOG_PENDING_BYTE`         | 10485760 (10MB) | Total size limit for pending log data                 |
+| `SYSD_LIMIT_LOG_PENDING_N`            | 100000          | Max entries in the log batch thread's internal buffer |
+| `SYSD_LIMIT_LOG_CHANNEL_CAPACITY_N`   | 1000            | Log input MPSC channel capacity                       |
+| `SYSD_LIMIT_DB_CHANNEL_CAPACITY_N`    | 1000            | Database worker channel buffer size                   |
+| `SYSD_LIMIT_CHANNEL_CAPACITY_N`       | 64              | General MPSC channel capacity                         |
+| `SYSD_LIMIT_STARTUP_WAIT_TIMEOUT_MS`  | 5000            | Maximum wait for the startup result during exit       |
+
+### Used by pm-sysd-ctl / pm-sysd-log
+
+| Environment variable                       | Default         | Description                           |
+| ------------------------------------------ | --------------- | ------------------------------------- |
+| `SYSD_LIMIT_IPC_M_BYTE`                    | 10485760 (10MB) | Maximum length of one IPC message     |
+| `SYSD_LIMIT_IPC_SEND_TIMEOUT_MS`           | 1000            | Send timeout for one IPC message      |
+| `SYSD_LIMIT_IPC_RECV_TIMEOUT_MS`           | 1000            | Receive timeout for one IPC message   |
+| `SYSD_LIMIT_IPC_CONNECT_TIMEOUT_MS`        | 200             | Windows pipe total connect-time limit |
+| `SYSD_LIMIT_IPC_CONNECT_RETRY_INTERVAL_MS` | 20              | Windows pipe connect retry interval   |
+
+`SYSD_LIMIT_IPC_M_BYTE`, `SYSD_LIMIT_IPC_SEND_TIMEOUT_MS`, and
+`SYSD_LIMIT_IPC_RECV_TIMEOUT_MS` are shared by init and ctl/log.
+
+It is recommended to use the same values on both sides; otherwise one side may
+send something the other refuses.
 
 ## Example
 

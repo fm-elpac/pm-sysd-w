@@ -5,20 +5,22 @@
 //! 本模块负责日志的写入 (含运行中进程 stdout/stderr 的采集),
 //! 查询与自动清理:
 //!
-//! - 写入采用专用 (同步) 线程 + MPSC: 发送方无阻塞 (`try_send`), 接收方
-//!   使用较大缓冲区 (1000 条) 缓存来不及写入的日志, 避免日志写入阻塞主逻辑.
-//!   日志写入线程位于 `db` 模块 (`db::DbClient`), 本模块只负责拆分/投递.
+//! - 写入采用两个专用 (同步) 线程 + MPSC: 发送方无阻塞 (`try_send`),
+//!   日志批发线程持有内部缓冲区 (限制总条数与总大小),
+//!   日志写入线程每次批发一批日志并在单个 sqlite 事务内批量写入.
+//!   详见 `db` 模块的线程模型.
 //!
 //! - 子进程 stdout/stderr 由后台任务按行 (超长分段) 读取后写入对应 unit 日志.
 //!
 //! - 日志查询命令 (`SdReqLogRO`) 由后台 task 处理, 返回分页响应.
 //!
-//! 防御性处理 (详见 `doc/dev/README.md`):
+//! 防御性处理 (内存目标见 `doc/dev/limit.md`):
 //!
-//! - 单条日志最大 [`MAX_LOG_LEN`] 字节, 超长由发送方拆分为多条.
+//! - 单条日志最大长度见 [`SysdLimit::log_line_byte`], 超长由发送方拆分为多条.
 //! - 发送失败 (缓冲区满 / 写入线程停止) 时丢弃并限速警告.
-//! - 日志自动清理: 每 [`LOG_CLEAN_INTERVAL`] 运行一次, 只保留最近
-//!   [`LOG_RETENTION`] 的日志.
+//! - 日志批发线程在总条数或总大小达到限制时丢弃日志并限速警告.
+//! - 日志自动清理: 每 [`SysdLimit::log_clean_interval`] 运行一次, 只保留最近
+//!   [`SysdLimit::log_retention`] 的日志.
 
 use std::time::{Duration, Instant};
 
@@ -30,6 +32,7 @@ use tokio::{
 };
 
 use crate::{
+    conf::limit::SysdLimit,
     db::{DbClient, DbError},
     jsonl::{SdReqLogRO, SdRes},
 };
@@ -44,48 +47,41 @@ mod test;
 
 pub use error::LogdError;
 pub use query::LogPage;
-pub use warn::{WARN_RATE_LIMIT, warn_rate_limited};
-
-/// 单条日志最大长度 (字节), 超出由发送方拆分为多条
-pub const MAX_LOG_LEN: usize = 500 * 1024;
-
-/// 日志自动清理间隔 (固定: 每 1 小时一次)
-pub const LOG_CLEAN_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// 日志保留时长 (固定: 最近 72 小时)
-pub const LOG_RETENTION: Duration = Duration::from_secs(72 * 3600);
-
-/// 单次日志分页查询允许的最大条数 (硬限制).
-///
-/// 外部请求的一页条数超过此值时, 自动按此值截断.
-pub const LOG_PAGE_MAX: u32 = 10_000;
+pub use warn::warn_rate_limited;
 
 /// 日志记录器.
 ///
-/// clone: 共享同一个数据库客户端 (数据库读写线程与日志写入线程) 与日志查询
-/// task 的消息通道.
+/// clone: 共享同一个数据库客户端 (数据库读写线程, 日志批发线程与日志写入线程)
+/// 与日志查询 task 的消息通道.
 #[derive(Clone)]
 pub struct Logd {
-    /// 数据库客户端 (异步读写与日志写入)
+    /// 数据库客户端 (异步读写与日志投递)
     db: DbClient,
     /// 日志查询 task 的消息通道 (只负责转发查询请求)
     tx: mpsc::Sender<(SdReqLogRO, oneshot::Sender<SdRes>)>,
+    /// 单条日志最大长度 (超长拆分)
+    line_byte: usize,
+    /// 单条 IPC 消息最大长度 (日志查询响应截断)
+    ipc_m_byte: usize,
+    /// 丢弃日志警告的最小间隔
+    warn_interval_min: Duration,
 }
 
 impl Logd {
     /// 创建日志记录器, 并启动日志清理 task 与日志查询 task.
     ///
-    /// 数据库读写线程与日志写入线程已由 [`DbClient::open`] 启动.
-    pub fn new(db: DbClient) -> Self {
+    /// 数据库读写线程, 日志批发线程与日志写入线程已由 [`DbClient::open`] 启动.
+    pub fn new(db: DbClient, limit: &SysdLimit) -> Self {
         // 日志自动清理 task
         let clean_db = db.clone();
+        let clean_interval = limit.log_clean_interval;
+        let retention = limit.log_retention;
         tokio::spawn(async move {
             loop {
-                sleep(LOG_CLEAN_INTERVAL).await;
+                sleep(clean_interval).await;
 
-                let before = (Utc::now()
-                    - chrono::Duration::seconds(LOG_RETENTION.as_secs() as i64))
-                .to_rfc3339_opts(SecondsFormat::Millis, true);
+                let before = (Utc::now() - chrono::Duration::seconds(retention.as_secs() as i64))
+                    .to_rfc3339_opts(SecondsFormat::Millis, true);
 
                 match clean_db.log_delete_before(&before).await {
                     Ok(n) => {
@@ -99,11 +95,19 @@ impl Logd {
         });
 
         // 日志查询 task
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(limit.channel_capacity_n);
         let query_db = db.clone();
-        tokio::spawn(async move { query::run(rx, query_db).await });
+        let ipc_m_byte = limit.ipc_m_byte;
+        let log_page_n = limit.log_page_n;
+        tokio::spawn(async move { query::run(rx, query_db, ipc_m_byte, log_page_n).await });
 
-        Self { db, tx }
+        Self {
+            db,
+            tx,
+            line_byte: limit.log_line_byte,
+            ipc_m_byte: limit.ipc_m_byte,
+            warn_interval_min: limit.warn_interval_min,
+        }
     }
 
     /// 写入一条日志 (级别 `info`, 无关联 unit)
@@ -120,14 +124,22 @@ impl Logd {
         let level = level.to_string();
         let unit = unit.map(|s| s.to_string());
 
-        for chunk in split_msg(msg, MAX_LOG_LEN) {
+        for chunk in split_msg(msg, self.line_byte) {
             match self.db.log_append(&ts, &level, unit.as_deref(), &chunk) {
                 Ok(()) => {}
                 Err(DbError::Busy(_)) => {
-                    warn_rate_limited("log-buffer-full", "log buffer full; dropping log");
+                    warn_rate_limited(
+                        "log-buffer-full",
+                        "log buffer full; dropping log",
+                        self.warn_interval_min,
+                    );
                 }
                 Err(_) => {
-                    warn_rate_limited("log-writer-stopped", "log writer stopped; dropping log");
+                    warn_rate_limited(
+                        "log-writer-stopped",
+                        "log writer stopped; dropping log",
+                        self.warn_interval_min,
+                    );
                 }
             }
         }

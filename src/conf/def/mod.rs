@@ -9,6 +9,8 @@ pub struct Conf {
     pub units: Vec<Unit>,
     /// sqlite 数据库路径 (绝对路径)
     pub db_path: String,
+    /// 日志表是否不创建索引 (对应 `[env] SYSD_DB_LOG_NO_INDEX`)
+    pub db_log_no_index: bool,
     /// 加载时产生的警告:
     /// 不支持的 `Unit.` / `Service.` / `Install.` / `Timer.` / `Win.` 前缀 key.
     /// 由调用方通过 `warn!()` 输出并写入日志.
@@ -147,3 +149,6 @@ pub struct Win {
     /// 仅 Windows 平台有效, Linux 上忽略
     pub create_no_window: bool,
 }
+
+#[cfg(test)]
+mod test;

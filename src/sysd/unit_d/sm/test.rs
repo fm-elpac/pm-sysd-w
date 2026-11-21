@@ -2,8 +2,9 @@
 
 use crate::{
     conf::Conf,
-    jsonl::{SdReq, SdReqUnit, SdReqUnitOp, SdReqUnitd, SdRes},
+    jsonl::{SdReq, SdReqUnit, SdReqUnitOp, SdReqUnitd, SdReqUnitdRO, SdRes},
     sysd::{TARGET_DEFAULT, reload::ReloadR},
+    sysu::DaemonSta,
 };
 
 use super::super::unit_s::{UnitS, UnitSME};
@@ -70,6 +71,7 @@ fn async_self_serial_op_completion_emits_idle() {
         conf: Conf {
             units: Vec::new(),
             db_path: String::new(),
+            db_log_no_index: false,
             warnings: Vec::new(),
         },
         me: UnitSME::default(),
@@ -79,6 +81,32 @@ fn async_self_serial_op_completion_emits_idle() {
     assert!(
         matches!(actions.last(), Some(SmOutput::Idle)),
         "expected Idle as last action: {:?}",
+        actions
+    );
+}
+
+#[test]
+fn system_state_queries_while_running_and_stops_while_exiting() {
+    let mut sm = empty_sm();
+
+    let req = SdReq::UnitdRO(SdReqUnitdRO::SystemState);
+    let actions = sm.t(SmInput::SdReq(req.clone()));
+    assert!(
+        matches!(actions.as_slice(), [SmOutput::QueryService(..)]),
+        "unexpected actions: {:?}",
+        actions
+    );
+
+    let actions = sm.t(SmInput::Exit);
+    assert!(matches!(actions.as_slice(), [SmOutput::ExitService]));
+
+    let actions = sm.t(SmInput::SdReq(req));
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [SmOutput::Reply(SdRes::SystemState(DaemonSta::Stopping))]
+        ),
+        "unexpected actions: {:?}",
         actions
     );
 }

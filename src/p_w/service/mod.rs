@@ -26,6 +26,9 @@ use super::PwError;
 
 mod u;
 
+/// pm-sysd-init 作为 Windows 服务运行时的服务名.
+pub const SERVICE_NAME: &str = "pm_sysd_w_user";
+
 /// 服务主体回调: 在 SCM 服务线程中被调用, 完成实际工作.
 ///
 /// 参数为全局停止请求事件. 返回 `Err` 表示服务启动失败.

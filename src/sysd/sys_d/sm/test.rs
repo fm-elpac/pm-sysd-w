@@ -6,13 +6,14 @@ use crate::{
         SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO, SdReqUnitd, SdReqUnitdRO, SdRes,
     },
     sysd::{SysdError, init::Shutdown},
+    sysu::DaemonSta,
 };
 
 use super::{Sm, SmInput, SmOutput};
 
 /// 在 Running 状态处理一次输入.
 fn sm_running(input: SmInput) -> (Sm, Vec<SmOutput>) {
-    Sm::new().t(input)
+    Sm::Running.t(input)
 }
 
 /// 在 StoppingUnits 状态 (Exit) 处理一次输入.
@@ -24,8 +25,27 @@ fn sm_stopping(input: SmInput) -> (Sm, Vec<SmOutput>) {
 }
 
 #[test]
-fn sm_initial_running() {
-    assert!(matches!(Sm::new(), Sm::Running));
+fn sm_initial_starting() {
+    assert!(matches!(Sm::new(), Sm::Starting));
+}
+
+#[test]
+fn sm_starting_system_state() {
+    let (s, out) = Sm::new().t(SmInput::SdReq(SdReq::UnitdRO(SdReqUnitdRO::SystemState)));
+    assert!(matches!(s, Sm::Starting));
+    assert_eq!(out.len(), 1);
+    assert!(matches!(
+        &out[0],
+        SmOutput::Reply(SdRes::SystemState(DaemonSta::Starting))
+    ));
+}
+
+#[test]
+fn sm_starting_start_default_target_done() {
+    let (s, out) = Sm::new().t(SmInput::StartDefaultTargetDone(Ok(())));
+    assert!(matches!(s, Sm::Running));
+    assert_eq!(out.len(), 1);
+    assert!(matches!(&out[0], SmOutput::ReplyResult(Ok(()))));
 }
 
 #[test]
@@ -114,7 +134,9 @@ fn sm_running_start_default_target() {
     let (s, out) = sm_running(SmInput::StartDefaultTarget);
     assert!(matches!(s, Sm::Running));
     assert_eq!(out.len(), 1);
-    assert!(matches!(&out[0], SmOutput::SendStartDefaultTarget));
+    assert!(
+        matches!(&out[0], SmOutput::ReplyResult(Err(SysdError::Failed(m))) if m == "already running")
+    );
 }
 
 #[test]

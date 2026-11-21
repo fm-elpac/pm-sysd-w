@@ -24,6 +24,11 @@ pub enum SysDM {
 pub enum M {
     /// 外部消息包装
     M(SysDM),
+    /// UnitD 已启动 default.target (携带结果与原始回执)
+    StartDefaultTargetDone(
+        Result<(), SysdError>,
+        oneshot::Sender<Result<(), SysdError>>,
+    ),
     /// UnitD 已停止所有 unit (退出序列)
     ExitUnitsDone(Result<(), SysdError>, oneshot::Sender<SdRes>),
 }
@@ -41,6 +46,10 @@ impl fmt::Debug for M {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::M(m) => f.debug_tuple("M").field(m).finish(),
+            Self::StartDefaultTargetDone(result, _) => f
+                .debug_tuple("StartDefaultTargetDone")
+                .field(result)
+                .finish(),
             Self::ExitUnitsDone(result, _) => f.debug_tuple("ExitUnitsDone").field(result).finish(),
         }
     }
@@ -67,8 +76,11 @@ impl Serialize for M {
     {
         match self {
             Self::M(m) => serializer.serialize_newtype_variant("M", 0, "M", m),
+            Self::StartDefaultTargetDone(result, _) => {
+                serializer.serialize_newtype_variant("M", 1, "StartDefaultTargetDone", result)
+            }
             Self::ExitUnitsDone(result, _) => {
-                serializer.serialize_newtype_variant("M", 1, "ExitUnitsDone", result)
+                serializer.serialize_newtype_variant("M", 2, "ExitUnitsDone", result)
             }
         }
     }

@@ -12,7 +12,7 @@ pub mod s;
 mod p;
 
 pub use p::reached_target;
-pub use s::{EnableSta, LoadSta, ServiceSta, TargetSta, TimerSta, UnitSta, UnitSubSta};
+pub use s::{DaemonSta, EnableSta, LoadSta, ServiceSta, TargetSta, TimerSta, UnitSta, UnitSubSta};
 
 #[cfg(test)]
 mod test;

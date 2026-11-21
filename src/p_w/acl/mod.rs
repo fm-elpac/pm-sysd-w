@@ -249,3 +249,6 @@ fn current_user_sid() -> Result<AlignedBuffer, PwError> {
         slice::from_raw_parts(sid.0 as *const u8, sid_len)
     }))
 }
+
+#[cfg(test)]
+mod test;

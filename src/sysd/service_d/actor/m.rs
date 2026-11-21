@@ -50,6 +50,11 @@ pub enum ServiceDM {
     QueryRunningUnits {
         reply: oneshot::Sender<Vec<(String, Unit)>>,
     },
+    /// 按 pid 反查运行中 service 名称 (`None` 表示未找到)
+    QueryPid {
+        pid: u32,
+        reply: oneshot::Sender<Option<String>>,
+    },
 }
 
 /// ServiceS 发给 ServiceD 的消息 (通过 [`super::ServiceD::send_s`] 投递)
@@ -65,6 +70,11 @@ pub enum M {
     M(ServiceDM),
     /// ServiceS 回报包装
     S(MS),
+    /// 批量启动已全部完成 (携带结果与原始回执)
+    StartManyDone(
+        Result<(), SysdError>,
+        oneshot::Sender<Result<(), SysdError>>,
+    ),
 }
 
 impl fmt::Debug for ServiceDM {
@@ -87,6 +97,7 @@ impl fmt::Debug for ServiceDM {
                 .field("name", name)
                 .finish(),
             Self::QueryRunningUnits { .. } => f.write_str("QueryRunningUnits"),
+            Self::QueryPid { pid, .. } => f.debug_struct("QueryPid").field("pid", pid).finish(),
         }
     }
 }
@@ -108,6 +119,7 @@ impl fmt::Debug for M {
         match self {
             Self::M(m) => f.debug_tuple("M").field(m).finish(),
             Self::S(m) => f.debug_tuple("S").field(m).finish(),
+            Self::StartManyDone(result, _) => f.debug_tuple("StartManyDone").field(result).finish(),
         }
     }
 }
@@ -149,6 +161,11 @@ impl Serialize for ServiceDM {
             Self::QueryRunningUnits { .. } => {
                 serializer.serialize_unit_variant("ServiceDM", 7, "QueryRunningUnits")
             }
+            Self::QueryPid { pid, .. } => {
+                let mut v = serializer.serialize_struct_variant("ServiceDM", 8, "QueryPid", 1)?;
+                v.serialize_field("pid", pid)?;
+                v.end()
+            }
         }
     }
 }
@@ -177,6 +194,9 @@ impl Serialize for M {
         match self {
             Self::M(m) => serializer.serialize_newtype_variant("M", 0, "M", m),
             Self::S(m) => serializer.serialize_newtype_variant("M", 1, "S", m),
+            Self::StartManyDone(result, _) => {
+                serializer.serialize_newtype_variant("M", 2, "StartManyDone", result)
+            }
         }
     }
 }

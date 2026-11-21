@@ -11,6 +11,7 @@ use tokio::runtime::Runtime;
 
 use crate::{
     cli::{complete_unit, connect, resolve_instance, set_instance},
+    conf::limit::SysdClientLimit,
     jsonl::{
         SdReq, SdReqLogQuery, SdReqLogQueryFilter, SdReqLogRO, SdReqPagePos, SdRes, SdResLogItem,
         decode_frame, encode_frame,
@@ -41,6 +42,8 @@ struct Args {
 ///
 /// 由 `src/bin/pm-sysd-log.rs` 调用.
 pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
+    let limit = SysdClientLimit::from_env();
+
     if a.iter().any(|s| s == "-h" || s == "--help") {
         print_help();
         return Ok(());
@@ -72,7 +75,7 @@ pub fn main(a: Vec<String>) -> Result<(), ExitCode> {
         }
     };
 
-    match rt.block_on(run(args.unit, instance)) {
+    match rt.block_on(run(args.unit, instance, &limit)) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("{}", e);
@@ -147,8 +150,12 @@ fn parse_args(a: &[String]) -> Result<Args, LogError> {
 }
 
 /// 主流程
-async fn run(unit: Option<String>, instance: Instance) -> Result<(), LogError> {
-    let mut stream = connect(&instance).await.map_err(LogError::Msg)?;
+async fn run(
+    unit: Option<String>,
+    instance: Instance,
+    limit: &SysdClientLimit,
+) -> Result<(), LogError> {
+    let mut stream = connect(&instance, limit).await.map_err(LogError::Msg)?;
 
     // 首次请求直接取最新 DEFAULT_LIMIT 条 (升序), 若单页装不下则按游标继续拉取.
     // 全程使用 asc=true, 页面内与页面间都保持 id 升序, 无需 reverse/sort.

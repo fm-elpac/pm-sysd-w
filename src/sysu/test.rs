@@ -1,6 +1,6 @@
 //! sysu 模块测试: 状态枚举与打印格式化.
 
-use super::{ServiceSta, TargetSta, TimerSta, UnitSubSta, reached_target};
+use super::{DaemonSta, ServiceSta, TargetSta, TimerSta, UnitSubSta, reached_target};
 
 #[test]
 fn reached_target_format() {
@@ -12,6 +12,25 @@ fn reached_target_format() {
         reached_target("exit.target"),
         "[  OK  ] Reached target exit.target."
     );
+}
+
+#[test]
+fn daemon_sta_display_and_exit_code() {
+    let cases = [
+        (DaemonSta::Initializing, "initializing", 1),
+        (DaemonSta::Starting, "starting", 1),
+        (DaemonSta::Running, "running", 0),
+        (DaemonSta::Degraded, "degraded", 1),
+        (DaemonSta::Maintenance, "maintenance", 1),
+        (DaemonSta::Stopping, "stopping", 1),
+        (DaemonSta::Offline, "offline", 1),
+        (DaemonSta::Unknown, "unknown", 1),
+    ];
+    for (sta, text, code) in cases {
+        assert_eq!(sta.as_str(), text);
+        assert_eq!(sta.to_string(), text);
+        assert_eq!(sta.exit_code(), code);
+    }
 }
 
 #[test]

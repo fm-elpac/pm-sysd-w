@@ -14,6 +14,8 @@ pub enum SmInput {
     SdReq(SdReq),
     /// 启动默认 target
     StartDefaultTarget,
+    /// UnitD 已启动 default.target (全链路等待完成)
+    StartDefaultTargetDone(Result<(), SysdError>),
     /// UnitD 已停止所有 unit (退出序列内部事件)
     ExitUnitsDone(Result<(), SysdError>),
 }
@@ -42,7 +44,7 @@ pub enum SmOutput {
         /// 完整消息行 (不含换行)
         msg: String,
     },
-    /// 通知 `sysd::init` 退出, 并退出 actor 主循环 (退出序列最后一步)
+    /// 通知 Server 退出, 并退出 actor 主循环 (退出序列最后一步)
     Finish {
         /// 退出方式
         shutdown: Shutdown,

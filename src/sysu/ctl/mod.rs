@@ -31,7 +31,7 @@ use crate::{
     conf::Unit,
     jsonl::{
         SdReq, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitd, SdRes, SdResTimerInfo, SdResUnitS,
-        SdResUnitState, SdResUnitStatus,
+        SdResUnitState, SdResUnitStatus, SdResWhoami,
     },
 };
 
@@ -73,6 +73,10 @@ pub fn print_response(cmd_name: &str, cmd: &SdReq, resp: SdRes) -> u8 {
             println!("{}", target);
             0
         }
+        SdRes::SystemState(sta) => {
+            println!("{}", sta);
+            sta.exit_code()
+        }
         SdRes::Dependencies(page) => {
             for d in &page.list {
                 println!("{}", d);
@@ -88,6 +92,88 @@ pub fn print_response(cmd_name: &str, cmd: &SdReq, resp: SdRes) -> u8 {
             eprintln!("unexpected response: logs");
             1
         }
+        SdRes::Whoami(_) => {
+            // whoami 在 ctl 中单独处理, 不会走到这里.
+            eprintln!("unexpected response: whoami");
+            1
+        }
+    }
+}
+
+/// 打印 `whoami` 结果.
+///
+/// 默认多行 `KEY=VALUE`; `--json` 时输出单行 JSON (使用相同 key).
+pub fn print_whoami(resp: &SdRes, json: bool) -> u8 {
+    match resp {
+        SdRes::Whoami(w) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&whoami_json(w)).expect("encode whoami json")
+                );
+            } else {
+                for (k, v) in whoami_pairs(w) {
+                    println!("{}={}", k, v);
+                }
+            }
+            0
+        }
+        SdRes::Err(message) => {
+            eprintln!("{}", message);
+            1
+        }
+        _ => {
+            eprintln!("unexpected response: whoami");
+            1
+        }
+    }
+}
+
+/// 把 `whoami` 结果转换为 JSON 对象 (key 与文本格式一致, 数字使用 JSON 数字).
+fn whoami_json(w: &SdResWhoami) -> serde_json::Value {
+    match w {
+        SdResWhoami {
+            service: Some(name),
+            ..
+        } => serde_json::json!({ "Service": name }),
+        SdResWhoami {
+            init: Some(init), ..
+        } => {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "InstanceType".to_string(),
+                serde_json::json!(init.instance_type),
+            );
+            m.insert(
+                "InstanceName".to_string(),
+                serde_json::json!(init.instance_name),
+            );
+            m.insert("Pid".to_string(), serde_json::json!(init.pid));
+            if let Some(name) = &init.service_name {
+                m.insert("ServiceName".to_string(), serde_json::json!(name));
+            }
+            serde_json::Value::Object(m)
+        }
+        _ => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// 把 `whoami` 结果转换为 `(key, value)` 列表, 供文本输出使用.
+fn whoami_pairs(w: &SdResWhoami) -> Vec<(String, String)> {
+    if let Some(init) = &w.init {
+        let mut pairs = vec![
+            ("InstanceType".to_string(), init.instance_type.clone()),
+            ("InstanceName".to_string(), init.instance_name.clone()),
+            ("Pid".to_string(), init.pid.to_string()),
+        ];
+        if let Some(name) = &init.service_name {
+            pairs.push(("ServiceName".to_string(), name.clone()));
+        }
+        pairs
+    } else if let Some(service) = &w.service {
+        vec![("Service".to_string(), service.clone())]
+    } else {
+        Vec::new()
     }
 }
 

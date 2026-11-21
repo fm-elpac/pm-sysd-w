@@ -6,7 +6,10 @@
 //! 本模块只处理命令行紧密相关的部分 (参数解析 / 帮助).
 //! 常驻主循环见 `sysd::init`, soft-reboot 见 `pa`.
 
-use std::{env, process::ExitCode};
+use std::process::ExitCode;
+
+#[cfg(target_os = "windows")]
+use std::env;
 
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
@@ -15,16 +18,19 @@ use tokio::runtime::Runtime;
 
 use crate::{
     cli::set_instance,
-    conf::load_conf,
+    conf::limit::SysdLimit,
     pa::{Instance, soft_reboot},
-    sysd::init::{Shutdown, run},
+    sysd::{
+        init::{Shutdown, run},
+        reload::sub::run_reload,
+    },
 };
 
 #[cfg(target_os = "windows")]
 use crate::p_w::{
     PwError,
     console::adjust_console,
-    service::{StopEvent, run_dispatcher},
+    service::{SERVICE_NAME, StopEvent, run_dispatcher},
 };
 
 #[cfg(target_os = "windows")]
@@ -73,6 +79,8 @@ fn run_normal(a: &[String], print_version: fn(), soft_reboot_ok: bool) -> Result
     #[cfg(target_os = "windows")]
     adjust_console();
 
+    let limit = SysdLimit::from_env();
+
     if a.iter().any(|s| s == "-h" || s == "--help") {
         print_help();
         return Ok(());
@@ -94,7 +102,7 @@ fn run_normal(a: &[String], print_version: fn(), soft_reboot_ok: bool) -> Result
         }
     };
 
-    let shutdown = match rt.block_on(run(args.instance, args.conf, print_version)) {
+    let shutdown = match rt.block_on(run(args.instance, args.conf, print_version, limit)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}", e);
@@ -124,7 +132,7 @@ fn run_normal(a: &[String], print_version: fn(), soft_reboot_ok: bool) -> Result
 #[cfg(target_os = "windows")]
 fn run_as_service(print_version: fn()) -> Result<bool, PwError> {
     let _ = PRINT_VERSION.get_or_init(|| print_version);
-    run_dispatcher("pm_sysd_w_user", service_body)
+    run_dispatcher(SERVICE_NAME, service_body)
 }
 
 /// Windows: 服务主体回调.
@@ -151,27 +159,15 @@ pub fn main_reload(a: &[String]) -> Result<(), ExitCode> {
         return Err(ExitCode::FAILURE);
     }
 
-    match run_reload() {
+    let limit = SysdLimit::from_env();
+
+    match run_reload(&limit) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("{}", e);
             Err(ExitCode::FAILURE)
         }
     }
-}
-
-/// 执行 --reload 模式: 只加载 toml 配置, 不访问数据库
-fn run_reload() -> Result<(), String> {
-    let conf_path = env::var("PM_SYSD_CONF")
-        .map_err(|_| "PM_SYSD_CONF environment variable is not set".to_string())?;
-    if conf_path.is_empty() {
-        return Err("PM_SYSD_CONF is empty".to_string());
-    }
-
-    let conf = load_conf(&conf_path).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string(&conf).map_err(|e| e.to_string())?;
-    println!("{}", json);
-    Ok(())
 }
 
 /// 解析命令行参数

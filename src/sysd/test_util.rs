@@ -5,18 +5,41 @@ use std::{future::Future, pin::Pin};
 use tokio::sync::oneshot;
 
 use crate::{
-    conf,
+    conf::{self, limit::SysdLimit},
     jsonl::{
         SdReq, SdReqPagePos, SdReqUnit, SdReqUnitList, SdReqUnitOp, SdReqUnitOpRO, SdReqUnitRO,
         SdReqUnitd, SdReqUnitdRO, SdRes, SdResServiceStatus, SdResUnitS, SdResUnitState,
-        SdResUnitStatus,
+        SdResUnitStatus, SdResWhoamiInit,
     },
     logd::Logd,
     sysu::{EnableSta, LoadSta, UnitSta},
     test::TempDir,
 };
 
-use super::{SysD, SysDM, SysdError, init::Shutdown, reload::ReloadR};
+use super::{
+    Server, SysD, SysDM, SysdError,
+    init::Shutdown,
+    reload::{ReloadR, Reloader, assemble},
+};
+
+/// 测试用 Reloader: 直接解析配置文件, 不启动 `pm-sysd-init --reload` 子进程.
+pub struct TestReloader;
+
+impl Reloader for TestReloader {
+    fn reload<'a>(
+        &'a self,
+        db: Option<crate::db::DbClient>,
+        conf_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(ReloadR, crate::db::DbClient), SysdError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let limit = SysdLimit::default();
+            let conf = crate::conf::load_conf(conf_path, &limit)
+                .map_err(|e| SysdError::Failed(e.to_string()))?;
+            assemble(db, conf, &limit).await
+        })
+    }
+}
 
 /// 一个 立即成功退出 (退出码 0) 的 命令 (跨平台).
 pub fn ok_cmd() -> String {
@@ -117,7 +140,14 @@ pub fn make_sysd(text: &str) -> (SysD, Logd, TempDir) {
 }
 
 /// 写入 配置 并 构造 [`SysD`], 同时返回 退出信号 接收端.
-pub fn make_sysd_with_exit(text: &str) -> (SysD, Logd, TempDir, oneshot::Receiver<Shutdown>) {
+pub fn make_sysd_with_exit(
+    text: &str,
+) -> (
+    SysD,
+    Logd,
+    TempDir,
+    oneshot::Receiver<Result<Shutdown, SysdError>>,
+) {
     let dir = TempDir::new("sysd");
     let conf_path = dir.path().join("c.toml");
     std::fs::write(&conf_path, text).unwrap();
@@ -130,39 +160,41 @@ pub fn make_sysd_with_exit(text: &str) -> (SysD, Logd, TempDir, oneshot::Receive
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async move {
-            let conf =
-                crate::conf::load_conf(&load_path).map_err(|e| SysdError::Failed(e.to_string()))?;
-            let db = crate::db::DbClient::open(&conf.db_path)
-                .map_err(|e| SysdError::Failed(e.to_string()))?;
-            let rows = db
-                .unit_list_all()
-                .await
-                .map_err(|e| SysdError::Failed(e.to_string()))?;
-
-            let mut masked = std::collections::HashSet::new();
-            let mut enabled = std::collections::HashSet::new();
-            for u in rows {
-                if u.masked {
-                    masked.insert(u.name.clone());
-                }
-                if u.enabled {
-                    enabled.insert(u.name);
-                }
-            }
-
-            let me = super::unit_d::UnitSME { masked, enabled };
-            Ok::<_, SysdError>((ReloadR { conf, me }, db))
-        })
+        rt.block_on(async move { TestReloader.reload(None, &load_path).await })
     })
     .join()
     .unwrap()
     .unwrap();
 
-    let logd = Logd::new(db.clone());
-    let (exit_tx, exit_rx) = oneshot::channel::<Shutdown>();
-    let sysd = SysD::spawn(db, logd.clone(), &conf_path, load, exit_tx);
-    (sysd, logd, dir, exit_rx)
+    let logd = Logd::new(db.clone(), &SysdLimit::default());
+
+    // 构造一个只用于捕获退出结果的 Server (不绑定 IPC, 也不接受连接).
+    let instance = crate::pa::Instance::Machine(format!("sysd_test_{}", std::process::id()));
+    let (server, sender) = Server::new(instance, SysdLimit::default());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<Result<Shutdown, SysdError>>();
+    tokio::spawn(async move {
+        let r = server.loop_accept().await;
+        let _ = shutdown_tx.send(r);
+    });
+
+    let whoami = SdResWhoamiInit {
+        instance_type: "machine".to_string(),
+        instance_name: "sysd_test".to_string(),
+        pid: std::process::id(),
+        service_name: None,
+    };
+
+    let sysd = SysD::spawn(
+        db,
+        logd.clone(),
+        &conf_path,
+        load,
+        sender,
+        Box::new(TestReloader),
+        whoami,
+        &SysdLimit::default(),
+    );
+    (sysd, logd, dir, shutdown_rx)
 }
 
 /// 执行 一条 ctl 命令, 返回 响应.
