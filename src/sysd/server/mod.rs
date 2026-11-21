@@ -6,7 +6,7 @@
 //! Server 主循环只负责: 接受连接并转发给 SysD, 监听外部信号, 汇聚退出结果.
 //! 配置加载 / SysD 创建等初始化工作由 init 启动任务完成.
 
-use std::{future, sync::Arc};
+use std::sync::Arc;
 
 use log::{debug, error, trace};
 use serde::Serialize;
@@ -143,8 +143,8 @@ impl Server {
     /// 传入.
     pub async fn loop_accept(self) -> Result<Shutdown, SysdError> {
         let Self {
-            mut listener,
-            mut ro_listener,
+            listener,
+            ro_listener,
             mut rx,
             sysd_tx,
             sysd_rx,
@@ -162,9 +162,27 @@ impl Server {
         let (sig_tx, mut sig_rx) = mpsc::channel::<()>(1);
         spawn_signal_watch(sig_tx);
 
+        // 接受连接放在独立任务中: 若直接放在 select 分支里, 分支未被选中时
+        // 已建立的连接会被取消并丢弃 (Windows 上表现为客户端写失败
+        // "The pipe is being closed"). 独立任务把已接受的连接送入通道,
+        // 主循环取消通道接收不会丢失连接.
+        let (main_tx, mut main_rx) =
+            mpsc::channel::<Result<SysdConn, PaError>>(limit.channel_capacity_n);
+        let (ro_tx, mut ro_rx) =
+            mpsc::channel::<Result<SysdConn, PaError>>(limit.channel_capacity_n);
+        let main_task = match listener {
+            Some(l) => Some(tokio::spawn(accept_loop(l, main_tx))),
+            None => None,
+        };
+        let ro_task = match ro_listener {
+            Some(l) => Some(tokio::spawn(accept_loop(l, ro_tx))),
+            None => None,
+        };
+
         let mut conn_seq: u64 = 0;
         trace!("accept loop start");
-        loop {
+
+        let result = loop {
             tokio::select! {
                 msg = rx.recv() => {
                     match msg {
@@ -185,39 +203,63 @@ impl Server {
                         }
                         Some(ServerMsg::Exit(r)) => {
                             trace!("accept loop exit: {:?}", r);
-                            return r;
+                            break r;
                         }
                         None => {
                             error!("server sender dropped before exit");
-                            return Err(SysdError::Failed("server sender dropped".to_string()));
+                            break Err(SysdError::Failed("server sender dropped".to_string()));
                         }
                     }
                 }
                 _ = sig_rx.recv() => {
                     handle_signal(&sysd_rx).await;
                 }
-                accepted = main_accept(&mut listener) => {
-                    handle_accept(
-                        accepted,
-                        false,
-                        Conn::new(sysd_rx.clone(), exiting_rx.clone()),
-                        &main_sem,
-                        &mut conn_seq,
-                        &limit,
-                    );
+                accepted = main_rx.recv() => {
+                    match accepted {
+                        Some(accepted) => handle_accept(
+                            accepted,
+                            false,
+                            Conn::new(sysd_rx.clone(), exiting_rx.clone()),
+                            &main_sem,
+                            &mut conn_seq,
+                            &limit,
+                        ),
+                        None => {
+                            error!("main accept task stopped unexpectedly");
+                            break Err(SysdError::Failed("main accept task stopped".to_string()));
+                        }
+                    }
                 }
-                accepted_ro = ro_accept(&mut ro_listener) => {
-                    handle_accept(
-                        accepted_ro,
-                        true,
-                        Conn::new(sysd_rx.clone(), exiting_rx.clone()),
-                        &ro_sem,
-                        &mut conn_seq,
-                        &limit,
-                    );
+                accepted_ro = ro_rx.recv() => {
+                    match accepted_ro {
+                        Some(accepted_ro) => handle_accept(
+                            accepted_ro,
+                            true,
+                            Conn::new(sysd_rx.clone(), exiting_rx.clone()),
+                            &ro_sem,
+                            &mut conn_seq,
+                            &limit,
+                        ),
+                        None => {
+                            error!("ro accept task stopped unexpectedly");
+                            break Err(SysdError::Failed("ro accept task stopped".to_string()));
+                        }
+                    }
                 }
             }
+        };
+
+        // 结束接受任务并等待退出, 确保 listener 被 Drop (Linux 删除 socket 文件).
+        if let Some(task) = main_task {
+            task.abort();
+            let _ = task.await;
         }
+        if let Some(task) = ro_task {
+            task.abort();
+            let _ = task.await;
+        }
+
+        result
     }
 }
 
@@ -524,19 +566,23 @@ async fn send_conn_resp(conn: &mut SysdConn, resp: &SdRes) {
     }
 }
 
-/// 等待主管道的下一个连接; 主管道未绑定时永远 pending.
-async fn main_accept(l: &mut Option<SysdListener>) -> Result<SysdConn, PaError> {
-    match l.as_mut() {
-        Some(l) => l.accept().await,
-        None => future::pending::<Result<SysdConn, PaError>>().await,
-    }
-}
-
-/// 等待只读监听器的下一个连接; 无只读监听器时永远 pending.
-async fn ro_accept(l: &mut Option<SysdListener>) -> Result<SysdConn, PaError> {
-    match l.as_mut() {
-        Some(l) => l.accept().await,
-        None => future::pending::<Result<SysdConn, PaError>>().await,
+/// 独立接受连接的循环: 把接受的连接转发到主循环通道.
+///
+/// 主循环退出后通道接收端被丢弃, 发送失败即结束本任务.
+async fn accept_loop(mut listener: SysdListener, tx: mpsc::Sender<Result<SysdConn, PaError>>) {
+    loop {
+        match listener.accept().await {
+            Ok(conn) => {
+                if tx.send(Ok(conn)).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                if tx.send(Err(e)).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
 }
 
